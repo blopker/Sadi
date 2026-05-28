@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     let modelHost: ModelHost
     let transcript: TranscriptStore
+    let voiceprints: VoiceprintBook
     let controller: CaptureController
 
     @State private var micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -19,7 +20,13 @@ struct ContentView: View {
                     .frame(width: 320)
                 TranscriptList(
                     utterances: transcript.utterances,
-                    dropped: showDropped ? transcript.dropped : []
+                    dropped: showDropped ? transcript.dropped : [],
+                    voiceprints: voiceprints,
+                    onName: { utterance, name in
+                        guard let embedding = utterance.embedding else { return }
+                        _ = try? voiceprints.enroll(name: name, embedding: embedding)
+                        transcript.rerunVoiceprintMatching()
+                    }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -134,6 +141,8 @@ private struct MeterRow: View {
 private struct TranscriptList: View {
     let utterances: [Utterance]
     let dropped: [DroppedUtterance]
+    let voiceprints: VoiceprintBook
+    let onName: (Utterance, String) -> Void
 
     private var rows: [Row] {
         let kept = utterances.map { Row.kept($0) }
@@ -156,8 +165,12 @@ private struct TranscriptList: View {
                         ForEach(rows) { row in
                             switch row {
                             case .kept(let utt):
-                                UtteranceRow(utterance: utt)
-                                    .id(utt.id)
+                                UtteranceRow(
+                                    utterance: utt,
+                                    voiceprints: voiceprints,
+                                    onName: { name in onName(utt, name) }
+                                )
+                                .id(utt.id)
                             case .dropped(let d):
                                 DroppedRow(dropped: d)
                                     .id(d.id)
@@ -199,6 +212,66 @@ private struct TranscriptList: View {
     }
 }
 
+private struct NameSpeakerPopover: View {
+    let utterance: Utterance
+    let existingNames: [String]
+    let onSubmit: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Name this speaker")
+                .font(.headline)
+            Text("Future recordings will recognize them automatically.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            TextField("Name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(submit)
+
+            if !existingNames.isEmpty {
+                Text("Or pick from your voiceprint book:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(existingNames, id: \.self) { existing in
+                            Button(existing) {
+                                name = existing
+                                submit()
+                            }
+                            .buttonStyle(.plain)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(maxHeight: 100)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.escape)
+                Button("Save") { submit() }
+                    .keyboardShortcut(.return)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || utterance.embedding == nil)
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private func submit() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, utterance.embedding != nil else { return }
+        onSubmit(trimmed)
+        dismiss()
+    }
+}
+
 private struct DroppedRow: View {
     let dropped: DroppedUtterance
 
@@ -224,13 +297,29 @@ private struct DroppedRow: View {
 
 private struct UtteranceRow: View {
     let utterance: Utterance
+    let voiceprints: VoiceprintBook
+    let onName: (String) -> Void
+
+    @State private var showingNamePopover = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(speakerLabel)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(speakerColor)
-                .frame(width: 60, alignment: .trailing)
+            Button(action: { showingNamePopover = true }) {
+                Text(speakerLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(speakerColor)
+                    .frame(width: 80, alignment: .trailing)
+            }
+            .buttonStyle(.plain)
+            .help(utterance.embedding == nil ? "No embedding for this utterance" : "Click to name this speaker")
+            .disabled(utterance.embedding == nil)
+            .popover(isPresented: $showingNamePopover) {
+                NameSpeakerPopover(
+                    utterance: utterance,
+                    existingNames: voiceprints.prints.map(\.name).sorted(),
+                    onSubmit: onName
+                )
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(utterance.text)
                     .font(.body)

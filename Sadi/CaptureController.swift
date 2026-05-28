@@ -41,7 +41,8 @@ final class CaptureController {
         guard !isRunning else { return }
         guard let vad = modelHost.vad,
               let asrModels = modelHost.asrModels,
-              let diarizerModel = modelHost.diarizerModel
+              let diarizerModel = modelHost.diarizerModel,
+              let embeddingDiarizer = modelHost.embeddingDiarizer
         else {
             micStatus = "models not loaded"
             systemStatus = "models not loaded"
@@ -75,6 +76,7 @@ final class CaptureController {
                 vad: vad,
                 asrModels: asrModels,
                 diarizerModel: diarizerModel,
+                embeddingDiarizer: embeddingDiarizer,
                 store: transcript,
                 startWallClock: startWallClock
             )
@@ -102,6 +104,7 @@ final class CaptureController {
                 vad: vad,
                 asrModels: asrModels,
                 diarizerModel: diarizerModel,
+                embeddingDiarizer: embeddingDiarizer,
                 store: transcript,
                 startWallClock: startWallClock
             )

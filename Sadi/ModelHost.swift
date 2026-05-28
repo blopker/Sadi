@@ -9,6 +9,11 @@ import OSLog
 // passing it from the MainActor ModelHost into the per-stream actor safe.
 extension LSEENDModel: @unchecked @retroactive Sendable {}
 
+// DiarizerManager: we only call its read-only `extractSpeakerEmbedding`
+// helper from per-stream actors after init. Internal models are immutable
+// post-init; safe to mark @unchecked Sendable.
+extension DiarizerManager: @unchecked @retroactive Sendable {}
+
 /// Single point of truth for the FluidAudio models. Loads Silero VAD and
 /// Parakeet TDT v2 once at app start; both stream processors share the loaded
 /// weights (their decoder state is per-segment, not per-instance).
@@ -26,6 +31,12 @@ final class ModelHost {
     private(set) var vad: VadManager?
     private(set) var asrModels: AsrModels?
     private(set) var diarizerModel: LSEENDModel?
+    private(set) var embeddingDiarizer: DiarizerManager?
+
+    /// Stable identifier for the speaker-embedding model. Stamped into each
+    /// `Voiceprint` so we can detect (and refuse to match against) prints
+    /// from a different model release (SPEC §8.2).
+    nonisolated static let embeddingModelVersion = "fluidaudio-wespeaker-256d-v1"
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "models")
 
@@ -74,8 +85,22 @@ final class ModelHost {
                 stepSize: .step100ms
             )
             self.diarizerModel = lseend
+            state = .loading(fraction: 0.99, phase: "Loading speaker embedding")
+
+            // DiarizerModels carries both the segmentation + 256-dim WeSpeaker
+            // embedding model. We only use the embedding side (LS-EEND handles
+            // diarization itself), but DiarizerManager.extractSpeakerEmbedding
+            // needs the segmentation model loaded to size its all-ones mask.
+            let diarizerCache = AsrModels.defaultCacheDirectory(for: .v2)
+                .deletingLastPathComponent()
+                .appending(path: "speaker-diarization", directoryHint: .isDirectory)
+            let diarModels = try await DiarizerModels.load(from: diarizerCache)
+            let dm = DiarizerManager(config: .default)
+            dm.initialize(models: consume diarModels)
+            self.embeddingDiarizer = dm
+
             state = .ready
-            Self.log.info("Models ready (VAD + Parakeet v2 + LS-EEND dihard3)")
+            Self.log.info("Models ready (VAD + Parakeet v2 + LS-EEND dihard3 + WeSpeaker)")
         } catch {
             Self.log.error("Model load failed: \(String(describing: error), privacy: .public)")
             state = .failed(String(describing: error))

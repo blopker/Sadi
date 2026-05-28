@@ -18,6 +18,7 @@ actor StreamProcessor {
     private let vad: VadManager
     private let asr: AsrManager
     private let diarizer: LSEENDDiarizer
+    private let embeddingDiarizer: DiarizerManager
     private let store: TranscriptStore
     private let startWallClock: Date
 
@@ -42,6 +43,7 @@ actor StreamProcessor {
         vad: VadManager,
         asrModels: AsrModels,
         diarizerModel: LSEENDModel,
+        embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
         startWallClock: Date
     ) throws {
@@ -50,6 +52,7 @@ actor StreamProcessor {
         self.vad = vad
         self.asr = AsrManager(config: .default, models: asrModels)
         self.diarizer = try LSEENDDiarizer(model: diarizerModel)
+        self.embeddingDiarizer = embeddingDiarizer
         self.store = store
         self.startWallClock = startWallClock
         self.streamState = VadStreamState.initial()
@@ -137,30 +140,187 @@ actor StreamProcessor {
         do {
             var decoderState = try TdtDecoderState()
             let result = try await asr.transcribe(segmentSamples, decoderState: &decoderState)
-            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
+            let fullText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !fullText.isEmpty else { return }
 
-            let startedAt = wallClock(forSample: absoluteStart)
-            let endedAt = wallClock(forSample: absoluteEnd)
-            let speaker = resolveSpeaker(absoluteStart: absoluteStart, absoluteEnd: absoluteEnd)
-            // Raw RMS over the segment for the EchoFilter energy backstop.
-            var sumSq: Float = 0
-            for v in segmentSamples { sumSq += v * v }
-            let rms = segmentSamples.isEmpty
-                ? Float(0)
-                : (sumSq / Float(segmentSamples.count)).squareRoot()
-            let utterance = Utterance(
-                source: source,
-                speaker: speaker,
-                text: text,
-                startedAt: startedAt,
-                endedAt: endedAt,
-                asrConfidence: result.confidence,
-                rms: rms
+            let segmentStartSec = Double(absoluteStart) / Resampler.targetRate
+
+            // No per-token timing → single Utterance with dominant speaker.
+            guard let timings = result.tokenTimings, !timings.isEmpty else {
+                let cluster = dominantCluster(startSec: segmentStartSec, endSec: Double(absoluteEnd) / Resampler.targetRate)
+                let speaker = label(source: source, cluster: cluster)
+                await emitUtterance(
+                    text: fullText,
+                    runAudio: segmentSamples,
+                    fallbackAudio: segmentSamples,
+                    runStartSample: absoluteStart,
+                    runEndSample: absoluteEnd,
+                    speaker: speaker,
+                    confidence: result.confidence
+                )
+                return
+            }
+
+            // Per-token timing → split this VAD segment into one Utterance per
+            // speaker-coherent word run. Same approach pipetest uses; see
+            // scratch/pipetest/Sources/pipetest/main.swift for the offline
+            // mirror.
+            let words = groupTokensIntoWords(timings)
+            let runs = SpeakerSegmenter.splitIntoRuns(
+                tokens: words,
+                speakerAt: { [self] wordTimeRelative in
+                    let absoluteSec = segmentStartSec + wordTimeRelative
+                    return clusterAtInstant(timeSec: absoluteSec)
+                },
+                minTokensPerRun: 2
             )
-            await store.receive(utterance)
+
+            for run in runs {
+                let runText = run.text
+                if runText.isEmpty { continue }
+                let runStartIdx = max(0, Int(run.startTime * Resampler.targetRate))
+                let runEndIdx = min(segmentSamples.count, Int(run.endTime * Resampler.targetRate))
+                let runAudio = runEndIdx > runStartIdx
+                    ? Array(segmentSamples[runStartIdx..<runEndIdx])
+                    : segmentSamples
+
+                let runStartSample = absoluteStart + Int64(run.startTime * Resampler.targetRate)
+                let runEndSample = absoluteStart + Int64(run.endTime * Resampler.targetRate)
+                let speaker = label(source: source, cluster: run.speakerIndex)
+                await emitUtterance(
+                    text: runText,
+                    runAudio: runAudio,
+                    fallbackAudio: segmentSamples,
+                    runStartSample: runStartSample,
+                    runEndSample: runEndSample,
+                    speaker: speaker,
+                    confidence: result.confidence
+                )
+            }
         } catch {
             Self.log.error("ASR failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func emitUtterance(
+        text: String,
+        runAudio: [Float],
+        fallbackAudio: [Float],
+        runStartSample: Int64,
+        runEndSample: Int64,
+        speaker: SadiKit.Speaker,
+        confidence: Float?
+    ) async {
+        var sumSq: Float = 0
+        for v in runAudio { sumSq += v * v }
+        let rms = runAudio.isEmpty ? Float(0) : (sumSq / Float(runAudio.count)).squareRoot()
+
+        // 256-dim WeSpeaker embedding for voiceprint matching (SPEC §8).
+        // Need ≥300 ms of audio for a stable embedding; for shorter runs we
+        // fall back to the whole VAD-segment slice.
+        let embedAudio = runAudio.count >= 4_800 ? runAudio : fallbackAudio
+        let embedding = try? embeddingDiarizer.extractSpeakerEmbedding(from: embedAudio)
+
+        let utterance = Utterance(
+            source: source,
+            speaker: speaker,
+            text: text,
+            startedAt: wallClock(forSample: runStartSample),
+            endedAt: wallClock(forSample: runEndSample),
+            embedding: embedding,
+            asrConfidence: confidence,
+            rms: rms
+        )
+        await store.receive(utterance)
+    }
+
+    // MARK: - Per-token speaker queries
+
+    /// Group Parakeet's subword tokens into whole words. FluidAudio's ASR
+    /// normalizes `▁` → " " before populating TokenTiming.token, so a word
+    /// starts at any token whose text begins with a space (or, defensively,
+    /// the raw `▁` marker if a future version stops normalizing).
+    private func groupTokensIntoWords(_ timings: [TokenTiming]) -> [TimedToken] {
+        var words: [TimedToken] = []
+        var currentTexts: [String] = []
+        var currentStart: TimeInterval = 0
+        var currentEnd: TimeInterval = 0
+        for tt in timings {
+            let startsWord = tt.token.hasPrefix(" ") || tt.token.hasPrefix("▁")
+            if startsWord && !currentTexts.isEmpty {
+                words.append(TimedToken(
+                    text: currentTexts.joined(),
+                    startTime: currentStart,
+                    endTime: currentEnd
+                ))
+                currentTexts = []
+            }
+            if currentTexts.isEmpty {
+                currentStart = tt.startTime
+            }
+            currentTexts.append(tt.token)
+            currentEnd = tt.endTime
+        }
+        if !currentTexts.isEmpty {
+            words.append(TimedToken(
+                text: currentTexts.joined(),
+                startTime: currentStart,
+                endTime: currentEnd
+            ))
+        }
+        return words
+    }
+
+    /// Dominant cluster id over [startSec, endSec) across the diarizer's
+    /// finalized + tentative segments. Falls back to nil when the diarizer
+    /// has no segments overlapping the range.
+    private func dominantCluster(startSec: Double, endSec: Double) -> Int? {
+        let frameDur = Double(diarizer.modelFrameHz.map { 1 / $0 } ?? 0.1)
+        var overlap: [Int: Int] = [:]
+        for (idx, speaker) in diarizer.timeline.speakers {
+            for seg in speaker.finalizedSegments + speaker.tentativeSegments {
+                let segStartSec = Double(seg.startFrame) * frameDur
+                let segEndSec = Double(seg.endFrame) * frameDur
+                let lo = max(segStartSec, startSec)
+                let hi = min(segEndSec, endSec)
+                if hi > lo { overlap[idx, default: 0] += Int((hi - lo) / frameDur) }
+            }
+        }
+        return overlap.max(by: { $0.value < $1.value })?.key
+    }
+
+    /// Speaker cluster at a single instant — per-word lookup for
+    /// SpeakerSegmenter. Returns nil when no diarizer segment covers the
+    /// frame; SpeakerSegmenter then borrows the prior known speaker.
+    private func clusterAtInstant(timeSec: Double) -> Int? {
+        let frameDur = Double(diarizer.modelFrameHz.map { 1 / $0 } ?? 0.1)
+        let frame = Int(timeSec / frameDur)
+        for (idx, speaker) in diarizer.timeline.speakers {
+            for seg in speaker.finalizedSegments + speaker.tentativeSegments {
+                if seg.startFrame <= frame && frame <= seg.endFrame {
+                    return idx
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Visible-label mapping for a cluster id, mirroring resolveSpeaker's
+    /// case logic but parameterized so the run loop can call it once per
+    /// run instead of once per utterance.
+    private func label(source: Source, cluster: Int?) -> SadiKit.Speaker {
+        let speakers = diarizer.timeline.speakers
+        let sortedClusterIds = speakers.keys.sorted()
+        switch source {
+        case .system:
+            guard !speakers.isEmpty, let cid = cluster else { return .them }
+            if speakers.count <= 1 { return .them }
+            let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
+            return .remote(displayIndex)
+        case .mic:
+            guard !speakers.isEmpty, let cid = cluster else { return .localSpeaker(1) }
+            let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
+            return .localSpeaker(displayIndex)
         }
     }
 
@@ -178,46 +338,4 @@ actor StreamProcessor {
         startWallClock.addingTimeInterval(Double(sample) / Resampler.targetRate)
     }
 
-    /// SPEC §6.4: pick the speaker cluster that dominates this utterance's
-    /// time range. The label depends on the track:
-    /// - System: `.them` (single cluster) or `.remote(N)` (multi).
-    /// - Mic: `.localSpeaker(N)` based on the mic-side diarizer's clusters.
-    ///   TranscriptStore overrides this to `.you` in call mode (SPEC §7.3).
-    private func resolveSpeaker(absoluteStart: Int64, absoluteEnd: Int64) -> SadiKit.Speaker {
-        let frameDur = Double(diarizer.modelFrameHz.map { 1 / $0 } ?? 0.1)
-        let utteranceStartSec = Double(absoluteStart) / Resampler.targetRate
-        let utteranceEndSec = Double(absoluteEnd) / Resampler.targetRate
-
-        let speakers = diarizer.timeline.speakers
-
-        // Tally per-cluster frame overlap with [start, end).
-        var overlap: [Int: Int] = [:]
-        for (idx, speaker) in speakers {
-            let segments = speaker.finalizedSegments + speaker.tentativeSegments
-            for seg in segments {
-                let segStartSec = Double(seg.startFrame) * frameDur
-                let segEndSec = Double(seg.endFrame) * frameDur
-                let lo = max(segStartSec, utteranceStartSec)
-                let hi = min(segEndSec, utteranceEndSec)
-                if hi > lo {
-                    overlap[idx, default: 0] += Int((hi - lo) / frameDur)
-                }
-            }
-        }
-
-        let dominant = overlap.max(by: { $0.value < $1.value })?.key
-        let sortedClusterIds = speakers.keys.sorted()
-
-        switch source {
-        case .system:
-            guard !speakers.isEmpty, let dom = dominant else { return .them }
-            if speakers.count <= 1 { return .them }
-            let displayIndex = (sortedClusterIds.firstIndex(of: dom) ?? 0) + 1
-            return .remote(displayIndex)
-        case .mic:
-            guard !speakers.isEmpty, let dom = dominant else { return .localSpeaker(1) }
-            let displayIndex = (sortedClusterIds.firstIndex(of: dom) ?? 0) + 1
-            return .localSpeaker(displayIndex)
-        }
-    }
 }
