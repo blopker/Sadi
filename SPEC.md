@@ -462,9 +462,12 @@ No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAu
 - `com.apple.security.network.client` = true (for FluidAudio one-time model download)
 - `com.apple.security.files.user-selected.read-only` = true (for any "import audio file" feature)
 
-### Info.plist (via build settings)
+### Info.plist
 - `NSMicrophoneUsageDescription` — required, or mic permission request crashes.
+- `NSAudioCaptureUsageDescription` — required for the CoreAudio process tap (§5.2). macOS prompts "Sadi would like to record system audio" the first time `AudioDeviceStart` runs on the aggregate device. This is a separate permission category from Screen Recording.
 - **No** `NSScreenCaptureUsageDescription` — we don't use ScreenCaptureKit.
+
+> Implementation note: Xcode's `GENERATE_INFOPLIST_FILE = YES` machinery has a finite allowlist of recognized `INFOPLIST_KEY_*` build settings, and `NSAudioCaptureUsageDescription` isn't on it (as of Xcode 26.5). Use a hand-authored `Info.plist` referenced via `INFOPLIST_FILE` instead.
 
 ### Build settings
 - `MACOSX_DEPLOYMENT_TARGET = 26.0` (we're macOS 26+ only).
