@@ -1,0 +1,12 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Scratch
+scratch/verify/
