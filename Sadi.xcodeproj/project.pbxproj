@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		33E50BAA2FC6C68500736FD9 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 33E50BA92FC6C68500736FD9 /* FluidAudio */; };
+		A0001001000000000000A003 /* SadiKit in Frameworks */ = {isa = PBXBuildFile; productRef = A0001001000000000000A002 /* SadiKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +29,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				33E50BAA2FC6C68500736FD9 /* FluidAudio in Frameworks */,
+				A0001001000000000000A003 /* SadiKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -71,6 +73,7 @@
 			name = Sadi;
 			packageProductDependencies = (
 				33E50BA92FC6C68500736FD9 /* FluidAudio */,
+				A0001001000000000000A002 /* SadiKit */,
 			);
 			productName = Sadi;
 			productReference = 33E50B832FC6C50400736FD9 /* Sadi.app */;
@@ -103,6 +106,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				33E50BA82FC6C68500736FD9 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+				A0001001000000000000A001 /* XCLocalSwiftPackageReference "SadiKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 33E50B842FC6C50400736FD9 /* Products */;
@@ -271,9 +275,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Sadi records your microphone to transcribe conversations on-device.";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Sadi-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -308,9 +311,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Sadi records your microphone to transcribe conversations on-device.";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Sadi-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -351,6 +353,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		A0001001000000000000A001 /* XCLocalSwiftPackageReference "SadiKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = SadiKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		33E50BA82FC6C68500736FD9 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -367,6 +376,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 33E50BA82FC6C68500736FD9 /* XCRemoteSwiftPackageReference "FluidAudio" */;
 			productName = FluidAudio;
+		};
+		A0001001000000000000A002 /* SadiKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0001001000000000000A001 /* XCLocalSwiftPackageReference "SadiKit" */;
+			productName = SadiKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
