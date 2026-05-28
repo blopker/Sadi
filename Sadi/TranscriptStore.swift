@@ -16,7 +16,9 @@ final class TranscriptStore {
 
     /// Either-stream entry point. System always kept (and recorded for the
     /// filter's overlap lookups). Mic runs through the filter in call mode
-    /// (call mode = any system utterance has been seen so far).
+    /// (call mode = any system utterance has been seen so far). SPEC §7.3:
+    /// in call mode all mic clusters fold to `.you`; in mic-only mode the
+    /// StreamProcessor's `.localSpeaker(N)` survives.
     func receive(_ utterance: Utterance) {
         if utterance.source == .system {
             systemLog.append(utterance)
@@ -24,13 +26,17 @@ final class TranscriptStore {
             return
         }
         if systemLog.isEmpty {
-            // Mic-only mode — no filter, no system utterances to compare to.
+            // Mic-only mode — no filter, keep the StreamProcessor's
+            // .localSpeaker(N) label.
             utterances.append(utterance)
             return
         }
+        // Call mode: filter for bleed; survivors collapse to .you.
         switch filter.decide(mic: utterance, system: systemLog) {
         case .keep:
-            utterances.append(utterance)
+            var u = utterance
+            u.speaker = .you
+            utterances.append(u)
         case .drop(let reason):
             dropped.append(DroppedUtterance(utterance: utterance, reason: reason))
         }

@@ -179,17 +179,16 @@ actor StreamProcessor {
     }
 
     /// SPEC §6.4: pick the speaker cluster that dominates this utterance's
-    /// time range across the diarizer's finalized + tentative segments.
-    /// Phase 5 only varies the label on the system track; mic stays `.you`.
+    /// time range. The label depends on the track:
+    /// - System: `.them` (single cluster) or `.remote(N)` (multi).
+    /// - Mic: `.localSpeaker(N)` based on the mic-side diarizer's clusters.
+    ///   TranscriptStore overrides this to `.you` in call mode (SPEC §7.3).
     private func resolveSpeaker(absoluteStart: Int64, absoluteEnd: Int64) -> SadiKit.Speaker {
-        if source == .mic { return .you }
-
         let frameDur = Double(diarizer.modelFrameHz.map { 1 / $0 } ?? 0.1)
         let utteranceStartSec = Double(absoluteStart) / Resampler.targetRate
         let utteranceEndSec = Double(absoluteEnd) / Resampler.targetRate
 
         let speakers = diarizer.timeline.speakers
-        guard !speakers.isEmpty else { return .them }
 
         // Tally per-cluster frame overlap with [start, end).
         var overlap: [Int: Int] = [:]
@@ -206,17 +205,19 @@ actor StreamProcessor {
             }
         }
 
-        guard let dominant = overlap.max(by: { $0.value < $1.value }) else {
-            return .them
-        }
-
-        // SPEC §8.1: `.them` if only one cluster has appeared; `.remote(N)`
-        // (1-indexed in display order) once there are multiple.
-        if speakers.count <= 1 {
-            return .them
-        }
+        let dominant = overlap.max(by: { $0.value < $1.value })?.key
         let sortedClusterIds = speakers.keys.sorted()
-        let displayIndex = (sortedClusterIds.firstIndex(of: dominant.key) ?? 0) + 1
-        return .remote(displayIndex)
+
+        switch source {
+        case .system:
+            guard !speakers.isEmpty, let dom = dominant else { return .them }
+            if speakers.count <= 1 { return .them }
+            let displayIndex = (sortedClusterIds.firstIndex(of: dom) ?? 0) + 1
+            return .remote(displayIndex)
+        case .mic:
+            guard !speakers.isEmpty, let dom = dominant else { return .localSpeaker(1) }
+            let displayIndex = (sortedClusterIds.firstIndex(of: dom) ?? 0) + 1
+            return .localSpeaker(displayIndex)
+        }
     }
 }
