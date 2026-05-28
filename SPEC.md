@@ -2,6 +2,8 @@
 
 A fully on-device macOS meeting transcriber, designed to be rebuilt from scratch against this document. Targets macOS 26+, Apple Silicon, sandboxed.
 
+> 📎 **See `HANDOFF.md` for current repo state, files on disk, and decisions already made.** This document is the design; `HANDOFF.md` is the operational context.
+
 ---
 
 ## 1. Problem Statement
@@ -77,9 +79,9 @@ The user records a room with multiple people present via the Mac's mic only. No 
               │  - ring buffer             │    │  - ring buffer + effective-  │
               │  - Silero VAD              │    │    rate correction           │
               │  - per-segment ASR         │    │  - Silero VAD                │
-              │  - file writer (mono CAF)  │    │  - per-segment ASR           │
+              │  - file writer (fMP4 AAC)  │    │  - per-segment ASR           │
               └──────────────┬─────────────┘    │  - LS-EEND diarizer (live)   │
-                             │                  │  - file writer (mono CAF)    │
+                             │                  │  - file writer (fMP4 AAC)    │
                              │                  └───────────────┬──────────────┘
                              │ Utterance{mic, ...}              │ Utterance{system, ...}
                              └───────────────┬──────────────────┘
@@ -114,17 +116,22 @@ Every box is its own actor or task. Buffers flow through `AsyncStream`; finalize
 
 ## 5. Capture Layer
 
+### 5.0 Realtime-thread discipline
+
+Both capture sources (AVAudioEngine input tap, CoreAudio IOProc) invoke their callbacks on a **fixed-priority realtime thread**. Inside those callbacks the code must not allocate, not take locks, not call Obj-C runtime services that may, and not log. The handoff to the rest of the pipeline is via a **lock-free, wait-free single-producer / single-consumer (SPSC) ring buffer** — one per stream. The callback's only job is to copy its incoming samples into the ring and return.
+
+A reference implementation lives at `Sadi/SPSCRingBuffer.swift`: power-of-two capacity, monotonic indices with mask-on-access, release/acquire memory ordering, `Float` samples, `@unchecked Sendable`. Producer = the realtime thread; consumer = a long-running `Task` on a normal-priority queue. The consumer side is where all resampling, file writing, VAD, ASR, and diarization happen.
+
+Capacity per ring: sized for the maximum tolerated end-to-end consumer latency, e.g. 1 second of source-rate float = 192 KB at 48 kHz mono. Two streams → ~400 KB total, lives for the duration of a recording.
+
 ### 5.1 Microphone Capture (`MicCapture`)
 
 - **Framework:** `AVAudioEngine` with an input-node tap on bus 0, buffer size 4096.
 - **No voice processing.** `setVoiceProcessingEnabled` is never called. The pipeline expects raw, unprocessed mic audio throughout. See §12 and Appendix A for the reasoning.
-- **Multi-channel handling:** Read the input node's current format. If `channelCount > 1`, take **channel 0 only** (per-buffer copy of `floatChannelData[0]`). MacBook built-in mics expose 3-channel arrays where channels 1+ are directional/cancellation beams; averaging them destroys the voice signal. Same rationale as OpenOats.
-- **Sample rate:** Query the **hardware** nominal rate of the resolved input device (`AudioObjectGetPropertyData` with `kAudioDevicePropertyNominalSampleRate`) and prefer it over the `inputNode.outputFormat` rate when they disagree — this catches the post-device-switch lag where AVAudioEngine still reports the old rate for a beat.
-- **Output:** an `AsyncStream<TimedPCMBuffer>` where each element is:
-  - `samples: [Float]` — mono float32 at the source sample rate
-  - `hostTime: UInt64` — Mach absolute time of the buffer's first sample
-  - `sampleRate: Double` — the rate above
-- **No file write here.** A separate consumer writes a mono CAF for the recording archive. This keeps capture latency-free and lets the streaming consumer get every buffer.
+- **Multi-channel handling:** Read the input node's current format. If `channelCount > 1`, take **channel 0 only** (per-buffer copy of `floatChannelData[0]`). MacBook built-in mics expose 3-channel arrays where channels 1+ are directional/cancellation beams; averaging them destroys the voice signal. The channel-0 extraction happens **inside the tap callback** (it's a pointer copy, allocation-free) before pushing to the ring.
+- **Sample rate:** Query the **hardware** nominal rate of the resolved input device (`AudioObjectGetPropertyData` with `kAudioDevicePropertyNominalSampleRate`) and prefer it over the `inputNode.outputFormat` rate when they disagree — this catches the post-device-switch lag where AVAudioEngine still reports the old rate for a beat. (Read once at session start; live changes mid-session are out of scope.)
+- **Tap callback work:** channel-0 extraction → `ring.push(data:)`. Nothing else. The first-buffer host time is recorded once via a separate atomic so the consumer can convert sample offsets to wall-clock dates.
+- **No file write here.** The consumer thread pulls samples and writes the archive file (§6.1).
 
 ### 5.2 System Audio Capture (`SystemAudioCapture`)
 
@@ -137,25 +144,32 @@ Every box is its own actor or task. Buffers flow through `AsyncStream`; finalize
   - No video pipeline to babysit (SCStream needs a throwaway video output to satisfy its config requirements).
   - Smaller permission surface; cleaner audio path.
 - **Mono mixdown:** done by CoreAudio in the tap config; receive a single channel of Float32 PCM.
-- **Effective sample-rate correction:** CoreAudio taps report a nominal rate that does not always match what they actually deliver. Track `(firstHostTime, totalFramesWritten)` continuously; expose `effectiveSampleRate = totalFrames / wallSeconds`. Resampling consumers use this, not the declared rate. This is the OpenOats trick; it prevents subtle long-term drift between mic and system.
-- **Output:** same `AsyncStream<TimedPCMBuffer>` shape as `MicCapture`.
+- **IO callback work:** `ring.push(data:)`. Nothing else.
+- **Effective sample-rate correction (consumer-side):** CoreAudio taps report a nominal rate that does not always match what they actually deliver. The *consumer thread* tracks `(firstHostTime, totalFramesPushed)` continuously; the resampler uses the computed `effectiveSampleRate = totalFramesPushed / wallSeconds` rather than the declared rate. This is the OpenOats trick; prevents subtle long-term drift between mic and system. None of this math happens on the realtime thread.
 
 ### 5.3 Synchronization
 
-Both streams are tagged with `mach_absolute_time` host time at buffer level. Downstream consumers align by host time when they need to relate the two streams (specifically: the `EchoFilter` checks overlap of utterance time windows). No sample-accurate alignment is required because we never feed both streams into a single signal-processing stage.
+Both rings tag their first push with the realtime thread's `mach_absolute_time`. From then on, each pulled sample's host time is `firstHostTime + framesPulled * (1 / effectiveSampleRate) * machTimebase`. The consumer can map any sample → host time → wall-clock `Date` (using a session-start anchor). The `EchoFilter` later compares utterance time windows in wall-clock space.
+
+No sample-accurate alignment is required between mic and system because we never feed both streams into a single signal-processing stage.
 
 ---
 
 ## 6. Streaming Pipeline
 
-### 6.1 Buffer Plumbing
+### 6.1 Consumer thread
 
-Each track runs an `AudioStream` actor that owns:
-- An in-memory **ring buffer** sized for the maximum VAD lookahead (e.g., 30 seconds at 16 kHz mono Float32 = 1.9 MB). Capture consumers push, VAD consumer pops.
-- A **resampler** (`AVAudioConverter`) that lazily resamples each pushed buffer from the source rate to **16 kHz mono** (what FluidAudio's ASR and diarizer expect). For the system track, the resampler uses the *effective* sample rate, not the declared one.
-- A **file writer** that writes the source-rate samples (pre-resample) to a mono CAF in the recording's directory. The CAF is the archive; recompute later if needed.
+Each track runs a long-lived consumer `Task` that:
+1. Pulls Float samples from the SPSC ring (§5.0) in fixed-size frames (e.g. 512 samples at the source rate, ~10 ms at 48 kHz).
+2. **Encodes the samples to mono AAC at 64 kbps and appends them to the segment's archive file as fragmented MP4** — `AVAssetWriter` with `movieFragmentInterval = CMTime(seconds: 10, …)` so each fragment is independently playable on crash. See §10 for the file path and §10.6 for the size / rate tradeoff and the open TODO to evaluate 32 kbps.
+3. Feeds the same source-rate samples through an `AVAudioConverter` to produce **16 kHz mono** — the rate FluidAudio's ASR, diarizer, and VAD all expect. The system track uses the *effective* sample rate (§5.2) for this resample, not the declared one.
+4. Hands the 16 kHz samples to the VAD/segmentation stage (§6.2).
 
-Backpressure: ring buffers are bounded; if a consumer can't keep up, drop the oldest unread audio and log a warning. Live transcription is best-effort — we prefer dropping audio over stalling capture.
+Encoding (step 2) and resampling (step 3) consume the same source-rate samples and run in parallel — the encoder uses Apple's hardware AAC path, the resampler is CPU. Neither blocks the other.
+
+The ring is the only shared mutable state across the realtime/consumer boundary. Within the consumer everything is plain Swift concurrency.
+
+Backpressure: the ring is bounded. If `ring.push(...)` returns `false` (full) — meaning the consumer is more than ~1 second behind — log it as a structured event and drop the incoming buffer. Live transcription is best-effort; we prefer losing a buffer to stalling the realtime thread.
 
 ### 6.2 VAD & Segmentation
 
@@ -172,12 +186,16 @@ Backpressure: ring buffers are bounded; if a consumer can't keep up, drop the ol
 - **Minimum-slice guard:** skip segments shorter than ~200 ms of audio. (Avoids the CoreML `E5RT: zero shape error` we saw on degenerate slices.)
 - **Output:** an `AsyncStream<Utterance>` per track.
 
-### 6.4 Diarization (System Track Only)
+### 6.4 Diarization
 
 - **Model:** FluidAudio's **LS-EEND** streaming diarizer.
-- **Operation:** runs in parallel with system-track ASR, consuming the same 16 kHz samples (sharing the ring buffer or a forked one). Maintains a per-recording speaker timeline: `[ (speakerIdx, startHostTime, endHostTime, centroidEmbedding) ]`. As new audio comes in, the timeline is updated (segments may be revised retroactively as more context arrives, which is fine — speaker labels are not finalized until the recording stops).
-- **Tagging utterances:** when a system-track `Utterance` is emitted, query the diarization timeline for the **dominant speaker** in `[utterance.startHostTime, utterance.endHostTime]` (by total overlap). Tag the utterance with the local cluster id and centroid embedding.
-- **No diarization on the mic** in call mode (mic = single local speaker, "You"). In **mic-only mode** (see §7), run the same LS-EEND on the mic to split in-room speakers.
+- **Both tracks always diarized.** Mic embeddings are required by the echo filter's fingerprint gate (§7) and by persistent speaker ID (§8), so there's no "skip diarization" mode — whether the recording is a call or mic-only is purely a labeling decision, made downstream.
+- **Operation:** runs in parallel with each track's ASR, consuming the same 16 kHz samples the ASR sees. Maintains a per-segment, per-track speaker timeline with cluster centroid embeddings. As more audio arrives, prior assignments may be revised retroactively — a fundamental property of streaming diarization. Labels are not considered final until the session stops.
+- **Tagging utterances:** when an `Utterance` is emitted, query its track's diarization timeline for the **dominant speaker** in `[utterance.startedAt, utterance.endedAt]` (by total overlap). Attach the local cluster id and centroid embedding to the utterance.
+- **Labeling differences (resolved in §7):**
+  - **System track clusters** → `.them` (single cluster) or `.remote(N)` (multi).
+  - **Mic track clusters** → `.you` in call mode (mic clusters collapsed); `.localSpeaker(N)` in mic-only mode (mic clusters kept distinct).
+  - Either side can be replaced by `.named(...)` via the voiceprint book (§8.2).
 
 ---
 
@@ -254,10 +272,13 @@ struct Voiceprint: Codable {
     var name: String
     var embedding: [Float]    // centroid; updated as samples accumulate
     var sampleCount: Int      // for incremental averaging
+    var modelVersion: String  // FluidAudio embedding model identifier at enrollment
     var createdAt: Date
     var updatedAt: Date
 }
 ```
+
+`modelVersion` is essential because FluidAudio's embedding model can change between releases. Embeddings produced by different model versions are not comparable. On startup, any voiceprint whose `modelVersion` doesn't match the current model is treated as "needs re-enrollment" — surfaced in the voiceprint management UI, not silently used.
 
 Stored as JSON at `<container>/Application Support/Sadi/Voiceprints/book.json`, plus a small SQLite or a daily backup snapshot for safety.
 
@@ -281,30 +302,42 @@ Stored as JSON at `<container>/Application Support/Sadi/Voiceprints/book.json`, 
 ## 9. Data Model
 
 ```swift
+/// A meeting / recording event. Identified by its start time at second
+/// resolution — sortable lexicographically, human-readable, never collides
+/// across calls (we record one session at a time).
+struct Session: Codable {
+    let id: String                   // "YYYY-MM-DD-HH-MM-SS" (local time, 24-hour)
+    var title: String
+    let startedAt: Date              // wall-clock start of segment 1
+    var endedAt: Date?               // nil while in-progress or paused
+    var segments: [Segment]          // 1+ contiguous record-to-pause periods
+    var speakerClusters: [SpeakerCluster]  // accumulated across all segments
+}
+
+/// One uninterrupted recording period within a session.
+/// Pause → finalize current segment, leave session open.
+/// Resume → append a new segment.
+struct Segment: Codable {
+    let index: Int                   // 1-indexed within the session
+    let startedAt: Date
+    var endedAt: Date?               // nil while this segment is recording
+    var micFilename: String          // e.g. "mic-001.mp4", relative to session dir
+    var systemFilename: String?      // nil in mic-only mode
+}
+
 /// One spoken contribution after the echo filter, ready to display.
 struct Utterance: Identifiable, Hashable, Codable {
     let id: UUID
-    let source: Source              // .mic | .system
+    let source: Source               // .mic | .system
     var speaker: Speaker
     let text: String
-    let startHostTime: UInt64       // nanoseconds since boot
-    let endHostTime: UInt64
-    let embedding: [Float]?         // present when source had diarization
-    let asrConfidence: Float?       // if model exposes it
+    let startedAt: Date              // wall-clock
+    let endedAt: Date                // wall-clock
+    let embedding: [Float]?          // present when source had diarization
+    let asrConfidence: Float?        // if model exposes it
 }
 
 enum Source: String, Codable { case mic, system }
-
-struct Recording: Identifiable, Codable {
-    let id: UUID
-    var title: String
-    let createdAt: Date
-    var endedAt: Date?
-    var micFileURL: URL              // mono CAF, source sample rate
-    var systemFileURL: URL?          // mono CAF, may be absent in mic-only
-    var utterances: [Utterance]      // append-only; persisted incrementally
-    var speakerClusters: [SpeakerCluster]  // per-recording clusters with centroids
-}
 
 struct SpeakerCluster: Codable {
     let id: UUID
@@ -316,25 +349,89 @@ struct SpeakerCluster: Codable {
 }
 ```
 
-`UInt64` host time is stored raw; convert to wall-clock at display time using the recording's `createdAt` and a host-time anchor captured at recording start.
+**On timestamps.** Internally during a segment, audio buffers carry `mach_absolute_time` host time for fast monotonic comparisons. Host time **doesn't survive reboot** and isn't comparable across segments (the audio engine restarts between them), so it's converted to a wall-clock `Date` at utterance-emission time using the segment's start anchor `(firstHostTime, startedAt)`. Persisted utterances carry wall-clock dates only; cross-segment ordering and display are both natural.
+
+**Session-state derivation.** No explicit "paused" / "in progress" / "finalized" enum. State is read from the data:
+- `session.endedAt != nil` → finalized.
+- `session.endedAt == nil` and last `segment.endedAt == nil` → currently recording.
+- `session.endedAt == nil` and last `segment.endedAt != nil` → paused (or interrupted; same shape on disk).
 
 ---
 
 ## 10. Persistence
 
-Recordings live in `<container>/Application Support/Sadi/Recordings/<UUID>/`:
+Layout under `<container>/Application Support/Sadi/`:
 
 ```
-<UUID>/
-  recording.json     ← Recording struct, rewritten on every utterance finalize
-  mic.caf            ← source-rate mono mic capture
-  system.caf         ← source-rate mono system capture (absent in mic-only)
-  marker.json        ← present only while recording is in progress (crash recovery)
+Sadi/
+  recordings/
+    2026-05-27-14-32-08/             ← session id = local-time timestamp at start
+      session.json                   ← metadata (title, segments, endedAt, speaker clusters)
+      transcript.json                ← utterances; written ONCE at session finalize
+      mic-001.mp4                    ← fragmented AAC mono 64 kbps, segment 1
+      system-001.mp4                 ← fragmented AAC mono 64 kbps, segment 1 (absent in mic-only)
+      mic-002.mp4                    ← if user paused then resumed
+      system-002.mp4
+      ...
+  voiceprints/
+    book.json                        ← persistent speaker identities
 ```
 
-Voiceprints live in `<container>/Application Support/Sadi/Voiceprints/book.json`. On each enrollment / update, write to `book.json.tmp` and atomically rename.
+### 10.1 Session IDs
 
-Crash recovery: on launch, scan for any `marker.json` files; if found, the recording is incomplete. Offer the user "recover" (try to re-transcribe from the saved CAFs) or "delete." We don't autoplay the raw recording silently — surface it.
+`YYYY-MM-DD-HH-MM-SS`, local time, 24-hour, all dashes. Lexicographic sort matches chronological order; no collision concern (we record one session at a time). If the user starts a second session in the same second (rapid stop/start), append `-1`, `-2`, etc. as a tiebreaker — cheap to detect at directory creation.
+
+### 10.2 Segments & pause / resume
+
+A session contains 1+ **segments**. Each segment = one press-record-to-pause/stop period and gets its own pair of fMP4 files (`mic-NNN.mp4`, `system-NNN.mp4`, 1-indexed, zero-padded to 3 digits).
+
+- **Pause:** finalize the current segment's audio writers (close the files cleanly), drain any in-flight ASR/diarization, set `segment.endedAt`, rewrite `session.json`. Session stays open (`session.endedAt == nil`).
+- **Resume:** allocate the next segment number, create new audio writers, start the capture stack again, append the new `Segment` to `session.segments`, rewrite `session.json`.
+- **Stop:** finalize the current segment as above, then write `transcript.json` once, set `session.endedAt`, rewrite `session.json`. Session is done.
+
+Utterances span segments naturally — they carry wall-clock dates and accumulate into one list. The pause gap shows up in the transcript as a time gap with no utterances; the UI can render a "⏸ paused N min" marker by inspecting `session.segments`.
+
+### 10.3 What's written when
+
+| Event | Files touched |
+|---|---|
+| Session start | `session.json` created; `mic-001.mp4` + `system-001.mp4?` opened for streaming write |
+| Each audio buffer | Encoded AAC fragments appended to the current segment's fMP4s (fragment finalized every 10 s) |
+| Pause | fMP4s for current segment closed (final fragment + index written); `segment.endedAt` set; `session.json` rewritten |
+| Resume | `mic-NNN.mp4` + `system-NNN.mp4?` opened for next segment; `session.json` rewritten |
+| Stop (finalize) | Current segment closed; `transcript.json` written once; `session.endedAt` set; `session.json` rewritten |
+| Speaker rename | `session.json` (clusters), `voiceprints/book.json` |
+
+`session.json` is small (no utterances inside it) so frequent rewrites are cheap. `transcript.json` is the big one and is written exactly once per session, at finalize.
+
+### 10.4 Atomic writes
+
+For `session.json`, `transcript.json`, and `book.json`: write to `<filename>.tmp` then `rename` over the live file. POSIX guarantees no half-written final file.
+
+### 10.5 Crash recovery
+
+No marker files. No launch-time scan. The directory structure *is* the state:
+
+- Any session with `session.endedAt == nil` is unfinalized. The sessions list shows it with a small badge ("interrupted" or "paused" — same on-disk shape).
+- Opening such a session offers a "**Finalize from audio**" action that re-runs the pipeline over the existing segment fMP4s to produce a `transcript.json`, then sets `session.endedAt`. Estimated runtime: a few minutes per hour of audio (§13 risk #5). User-initiated, not automatic; the user might prefer to delete instead.
+- Per-segment crash safety comes from the fragmented MP4 container: each 10-second fragment is a complete, self-contained `moof`+`mdat` pair, so a file that wasn't cleanly closed is still playable up to its last finalized fragment. A hard crash loses at most the in-flight ≤10 s fragment.
+
+Voiceprints (`book.json`) are only modified by user actions (rename / merge), so atomic-write is sufficient — there's no in-progress state to worry about.
+
+### 10.6 Audio format & size
+
+Default: **mono AAC, 64 kbps, encoded into fragmented MP4** (10-second fragment interval). Apple's hardware AAC encoder runs essentially free; the file is universally playable; ASR re-runs on decoded AAC are functionally identical to running on PCM at this bitrate.
+
+Size envelope (per stream; double for a call with both mic + system):
+
+| Bitrate | Per minute | Per hour | Per 5-hour day |
+|---|---|---|---|
+| **64 kbps (v1 default)** | ~0.5 MB | ~29 MB | ~145 MB |
+| 32 kbps (TODO: evaluate) | ~0.25 MB | ~14 MB | ~70 MB |
+
+**Open TODO:** Once we have a working pipeline, A/B-test 32 kbps against 64 kbps on real recordings — compare ASR transcripts (Parakeet output, ideally also a Whisper baseline) and listen-test the audio. AAC at 32 kbps mono is widely transparent for speech and is what podcast distribution often uses; if the WER delta on our recordings is in the noise, drop to 32 and halve storage. If it isn't, stay at 64.
+
+Either way the archive is small enough that storage isn't a constraint — both rates are 1–2 orders of magnitude smaller than the Float32 CAF baseline we'd have shipped otherwise.
 
 ---
 
@@ -390,10 +487,10 @@ Each phase ends at a testable milestone. Don't move on until the milestone passe
 Project scaffold (SwiftPM-based Xcode project), sandbox + entitlements, Sadi.entitlements file, build settings as above. App launches, requests mic permission, shows an empty window. **Milestone:** clean build, mic permission granted, empty UI.
 
 ### Phase 2 — Capture
-`MicCapture` and `SystemAudioCapture` per §5, each producing an `AsyncStream<TimedPCMBuffer>`. A debug view shows live RMS meters for both. **Milestone:** start/stop captures both tracks; meters move when you speak / when audio plays; no Screen Recording prompt ever appears.
+`MicCapture` and `SystemAudioCapture` per §5, each pushing into its SPSC ring (§5.0). A consumer `Task` pulls and feeds a debug RMS meter for each stream. **Milestone:** start/stop captures both tracks; meters move when you speak / when audio plays; no Screen Recording prompt ever appears; the realtime callback does nothing but `ring.push`.
 
 ### Phase 3 — File Archive
-A consumer per track writes the capture stream to a mono CAF in a recording directory, with the source-rate format. **Milestone:** stop a recording; play back both CAFs in Finder; mic.caf is your voice, system.caf is what was playing.
+The consumer task per track encodes pulled samples to mono AAC at 64 kbps and writes a fragmented MP4 (`mic-001.mp4` / `system-001.mp4`) into the session directory using `AVAssetWriter` with `movieFragmentInterval = 10s`. **Milestone:** stop a recording; play back both `.mp4` files in QuickTime; mic is your voice, system is what was playing; file sizes match the §10.6 envelope (~0.5 MB/min/stream).
 
 ### Phase 4 — VAD + Per-Track ASR
 Add the ring buffer, Silero VAD, and per-track ASR per §6.2 and §6.3. No diarization yet; no echo filter; tag mic utterances as `.you` and system as `.them` unconditionally. **Milestone:** live transcript appears in the UI for both tracks during recording.
@@ -414,7 +511,7 @@ Implement §8.2: voiceprint book on disk, resolution flow at recording finalize 
 Wire up the wall-clock-derived `effectiveSampleRate` in `SystemAudioCapture` and use it in the resampler. **Milestone:** record a long (>30 min) session; verify by spot-check that system utterances stay in time with mic utterances throughout. (This is a robustness fix, not a feature, but it's important for long meetings.)
 
 ### Phase 10 — Crash Recovery & Polish
-`marker.json` flow, recovery UI, debug toggles for dropped utterances, settings screen, voiceprint book management UI.
+"Finalize from audio" recovery action for unfinalized sessions (§10.5), pause / resume UI, "⏸ paused N min" markers in the transcript view, debug toggles for dropped utterances, settings screen, voiceprint book management UI, quit-while-recording confirmation dialog.
 
 ---
 
@@ -434,7 +531,7 @@ Wire up the wall-clock-derived `effectiveSampleRate` in `SystemAudioCapture` and
 
 7. **Memory on long meetings.** Ring buffers are bounded; utterances accumulate. A 4-hour recording at, say, 1 utterance/5 seconds × 1 KB per utterance = ~3 MB. Embeddings (256-dim Float32 = 1 KB each) double that. Comfortable; no streaming-to-disk needed for in-memory utterances during a session.
 
-8. **The mode-detection edge case.** If the user is in a call but the far-end happens to be silent for the first N seconds, we'd start in "mic-only mode" and produce mic-track diarization. As soon as the system speaks, we'd switch to call mode and start gating. Need to: (a) suppress the spurious mic-side diarization in retrospect, OR (b) start always-on diarization for both tracks and only differ at the labeling step. Option (b) is cleaner; do that.
+8. **Mode-detection edge case** — *resolved.* Diarization runs on both tracks at all times (§6.4); call-vs-mic-only is purely a labeling decision (§7.1), so a quiet first-N-seconds in the far-end doesn't produce spurious mic clusters that need unwinding.
 
 ---
 
