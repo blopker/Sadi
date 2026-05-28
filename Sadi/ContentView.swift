@@ -13,9 +13,11 @@ enum SpeakerPalette {
         return colors[idx % colors.count]
     }
 
-    /// Friendly label, e.g. "Speaker 1".
+    /// Friendly label: the local mic is "You"; far-end speakers are numbered.
     static func label(for speakerId: String, in order: [String]) -> String {
-        guard let idx = order.firstIndex(of: speakerId) else { return speakerId }
+        if speakerId == TranscriptSegment.localSpeakerID { return "You" }
+        let remote = order.filter { $0 != TranscriptSegment.localSpeakerID }
+        guard let idx = remote.firstIndex(of: speakerId) else { return speakerId }
         return "Speaker \(idx + 1)"
     }
 }

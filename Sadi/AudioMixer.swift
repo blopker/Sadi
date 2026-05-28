@@ -37,20 +37,8 @@ struct AudioMixer {
             presetName: AVAssetExportPresetAppleM4A) else {
             throw RecorderError.exportFailed
         }
-        export.outputURL = outputURL
-        export.outputFileType = .m4a
 
-        // exportAsynchronously is deprecated on macOS 15+ but still works and
-        // keeps the macOS 14 deployment target. Swap for `export(to:as:)`
-        // if you raise the minimum to macOS 15.
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            export.exportAsynchronously {
-                continuation.resume()
-            }
-        }
-
-        guard export.status == .completed else {
-            throw RecorderError.exportFailed
-        }
+        // macOS 15+ async export; throws on failure.
+        try await export.export(to: outputURL, as: .m4a)
     }
 }

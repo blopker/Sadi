@@ -1,5 +1,6 @@
 import AVFoundation
 import Carbon.HIToolbox
+import Combine
 import Foundation
 import SwiftUI
 
@@ -192,16 +193,18 @@ final class AppController: ObservableObject {
         library.clearMarker()
     }
 
-    /// Shared pipeline: mix the two tracks, then transcribe + diarize.
+    /// Shared pipeline: transcribe each source track, plus mix for playback.
     private func makeRecording(
         micURL: URL, systemURL: URL,
         startedAt: Date, title: String
     ) async throws -> Recording {
+        // The mix is kept only for playback; transcription runs on each source
+        // track separately so a quiet mic isn't swamped by loud system audio.
         let mixedURL = storageDir.appendingPathComponent("mixed-\(Self.fileStamp()).m4a")
         try await mixer.mix(micURL: micURL, systemURL: systemURL, outputURL: mixedURL)
 
         let duration = (try? await AVURLAsset(url: mixedURL).load(.duration))?.seconds ?? 0
-        let segments = try await transcriber.transcribe(fileURL: mixedURL)
+        let segments = try await transcriber.transcribe(micURL: micURL, systemURL: systemURL)
 
         return Recording(
             title: title,

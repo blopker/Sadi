@@ -12,12 +12,17 @@ final class MicRecorder {
     private(set) var isRecording = false
 
     /// When true, macOS's voice-processing audio unit is enabled on the mic
-    /// input. It applies acoustic echo cancellation (plus automatic gain
-    /// control and noise suppression), so the far-end voice bleeding out of
-    /// your speakers is largely removed from the mic track — no headphones
-    /// needed. The AGC/noise-suppression side effects are fine for
-    /// transcription; turn this off if you want unprocessed audio.
-    var echoCancellationEnabled = true
+    /// input (automatic gain control + noise suppression).
+    ///
+    /// Off by default: under the App Sandbox the voice processor can't reach
+    /// its analytics daemon, so it logs continuous downlink faults, and driving
+    /// the downlink to silence those faults overloads the I/O thread and
+    /// degrades capture (diarization then extracts zero speaker embeddings).
+    /// Its echo cancellation also only cancels audio *this* engine renders, so
+    /// it can't remove another app's speaker output (e.g. a Meet call) from the
+    /// mic regardless — diarization clusters that bleed as one speaker instead.
+    /// Flip to true only if you can live with the log noise.
+    var echoCancellationEnabled = false
 
     /// Reflects whether AEC actually engaged after the last `start()`.
     /// Some virtual / aggregate input devices don't support it.
@@ -59,17 +64,58 @@ final class MicRecorder {
             throw RecorderError.captureSetupFailed("Microphone reported an invalid audio format.")
         }
 
-        let audioFile = try AVAudioFile(forWriting: outputURL, settings: format.settings)
+        // Persist a single mono channel instead of the input node's native
+        // layout. With voice processing enabled, some devices expose the
+        // processed mic duplicated across several "discrete" channels (e.g. 9).
+        // A discrete multi-channel file has no standard layout, so it collapses
+        // to near-silence when AudioMixer downmixes it to stereo AAC — which
+        // surfaces downstream as "No speech detected." Channel 0 is the
+        // processed near-end mic, so we keep just that.
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false)
+        else {
+            throw RecorderError.captureSetupFailed("Couldn't create a mono recording format.")
+        }
+
+        let audioFile = try AVAudioFile(forWriting: outputURL, settings: monoFormat.settings)
         self.file = audioFile
 
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             // Writes happen on a real-time audio thread; keep this cheap.
-            try? self?.file?.write(from: buffer)
+            guard let mono = MicRecorder.monoBuffer(fromChannel: 0, of: buffer, as: monoFormat)
+            else { return }
+            try? self?.file?.write(from: mono)
         }
 
         engine.prepare()
         try engine.start()
         isRecording = true
+    }
+
+    /// Copies one channel of `buffer` into a fresh mono buffer in `format`.
+    /// Returns nil for interleaved/non-float sources; input-node tap buffers
+    /// are deinterleaved float, so this path is the expected one.
+    private static func monoBuffer(
+        fromChannel channel: Int,
+        of buffer: AVAudioPCMBuffer,
+        as format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        guard let src = buffer.floatChannelData,
+            channel < Int(buffer.format.channelCount)
+        else { return nil }
+
+        let frames = buffer.frameLength
+        guard frames > 0,
+            let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+            let dst = out.floatChannelData
+        else { return nil }
+
+        out.frameLength = frames
+        memcpy(dst[0], src[channel], Int(frames) * MemoryLayout<Float>.size)
+        return out
     }
 
     /// Stops capture and finalizes the file.

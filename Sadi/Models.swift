@@ -52,7 +52,11 @@ enum RecordingStatus: Equatable {
 
 /// One contiguous block of speech attributed to a single speaker.
 struct TranscriptSegment: Identifiable, Hashable, Codable {
-    let id = UUID()
+    /// `speakerId` value used for the local microphone speaker. The far-end
+    /// (system audio) keeps the diarizer's own speaker ids.
+    static let localSpeakerID = "__local__"
+
+    var id = UUID()
     var speakerId: String
     var startTime: Double
     var endTime: Double
@@ -67,7 +71,7 @@ struct TranscriptSegment: Identifiable, Hashable, Codable {
 
 /// A finished recording plus its transcript.
 struct Recording: Identifiable, Hashable, Codable {
-    let id = UUID()
+    var id = UUID()
     var title: String
     var createdAt: Date
     var micFileURL: URL
