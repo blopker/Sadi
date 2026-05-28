@@ -16,13 +16,19 @@ struct ContentView: View {
             HStack(spacing: 16) {
                 Button(controller.isRunning ? "Stop" : "Start") {
                     if controller.isRunning {
-                        controller.stop()
+                        Task { await controller.stop() }
                     } else {
                         controller.start()
                     }
                 }
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(micAuthorization != .authorized)
+            }
+
+            if !controller.sessionID.isEmpty {
+                Text("Session: \(controller.sessionID)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
 
             GroupBox("Mic") {
