@@ -8,6 +8,7 @@ struct ContentView: View {
     let controller: CaptureController
 
     @State private var micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+    @State private var showDropped = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -16,8 +17,11 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 16) {
                 metersColumn
                     .frame(width: 320)
-                TranscriptList(utterances: transcript.utterances)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                TranscriptList(
+                    utterances: transcript.utterances,
+                    dropped: showDropped ? transcript.dropped : []
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .padding(16)
@@ -34,6 +38,10 @@ struct ContentView: View {
         HStack {
             Text("Sadi").font(.title2)
             Spacer()
+            Toggle("Show dropped", isOn: $showDropped)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("Show utterances filtered out as echo bleed (\(transcript.dropped.count))")
             modelStatusView
             Button(controller.isRunning ? "Stop" : "Start") {
                 if controller.isRunning {
@@ -125,12 +133,19 @@ private struct MeterRow: View {
 
 private struct TranscriptList: View {
     let utterances: [Utterance]
+    let dropped: [DroppedUtterance]
+
+    private var rows: [Row] {
+        let kept = utterances.map { Row.kept($0) }
+        let droppedRows = dropped.map { Row.dropped($0) }
+        return (kept + droppedRows).sorted { $0.startedAt < $1.startedAt }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if utterances.isEmpty {
+                    if utterances.isEmpty && dropped.isEmpty {
                         ContentUnavailableView(
                             "No transcripts yet",
                             systemImage: "text.bubble",
@@ -138,9 +153,15 @@ private struct TranscriptList: View {
                         )
                         .padding(.top, 60)
                     } else {
-                        ForEach(utterances) { utt in
-                            UtteranceRow(utterance: utt)
-                                .id(utt.id)
+                        ForEach(rows) { row in
+                            switch row {
+                            case .kept(let utt):
+                                UtteranceRow(utterance: utt)
+                                    .id(utt.id)
+                            case .dropped(let d):
+                                DroppedRow(dropped: d)
+                                    .id(d.id)
+                            }
                         }
                     }
                 }
@@ -156,6 +177,48 @@ private struct TranscriptList: View {
                 }
             }
         }
+    }
+
+    private enum Row: Identifiable {
+        case kept(Utterance)
+        case dropped(DroppedUtterance)
+
+        var id: UUID {
+            switch self {
+            case .kept(let u): u.id
+            case .dropped(let d): d.id
+            }
+        }
+
+        var startedAt: Date {
+            switch self {
+            case .kept(let u): u.startedAt
+            case .dropped(let d): d.utterance.startedAt
+            }
+        }
+    }
+}
+
+private struct DroppedRow: View {
+    let dropped: DroppedUtterance
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "xmark.circle")
+                .foregroundStyle(.tertiary)
+                .frame(width: 60, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(dropped.utterance.text)
+                    .font(.body)
+                    .foregroundStyle(.tertiary)
+                    .strikethrough()
+                    .textSelection(.enabled)
+                Text("dropped: \(dropped.reason.rawValue) — \(dropped.utterance.startedAt, style: .time)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 

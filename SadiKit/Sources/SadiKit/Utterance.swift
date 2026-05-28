@@ -11,6 +11,9 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
     public let endedAt: Date
     public let embedding: [Float]?
     public let asrConfidence: Float?
+    /// Raw RMS of the segment samples, pre-normalization (SPEC §7.2c).
+    /// EchoFilter's energy backstop compares this across tracks.
+    public let rms: Float?
 
     public init(
         id: UUID = UUID(),
@@ -20,7 +23,8 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
         startedAt: Date,
         endedAt: Date,
         embedding: [Float]? = nil,
-        asrConfidence: Float? = nil
+        asrConfidence: Float? = nil,
+        rms: Float? = nil
     ) {
         self.id = id
         self.source = source
@@ -30,6 +34,7 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
         self.endedAt = endedAt
         self.embedding = embedding
         self.asrConfidence = asrConfidence
+        self.rms = rms
     }
 }
 

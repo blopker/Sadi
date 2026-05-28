@@ -143,15 +143,22 @@ actor StreamProcessor {
             let startedAt = wallClock(forSample: absoluteStart)
             let endedAt = wallClock(forSample: absoluteEnd)
             let speaker = resolveSpeaker(absoluteStart: absoluteStart, absoluteEnd: absoluteEnd)
+            // Raw RMS over the segment for the EchoFilter energy backstop.
+            var sumSq: Float = 0
+            for v in segmentSamples { sumSq += v * v }
+            let rms = segmentSamples.isEmpty
+                ? Float(0)
+                : (sumSq / Float(segmentSamples.count)).squareRoot()
             let utterance = Utterance(
                 source: source,
                 speaker: speaker,
                 text: text,
                 startedAt: startedAt,
                 endedAt: endedAt,
-                asrConfidence: result.confidence
+                asrConfidence: result.confidence,
+                rms: rms
             )
-            await store.append(utterance)
+            await store.receive(utterance)
         } catch {
             Self.log.error("ASR failed: \(String(describing: error), privacy: .public)")
         }
