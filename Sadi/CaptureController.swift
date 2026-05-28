@@ -39,7 +39,10 @@ final class CaptureController {
 
     func start() {
         guard !isRunning else { return }
-        guard let vad = modelHost.vad, let asrModels = modelHost.asrModels else {
+        guard let vad = modelHost.vad,
+              let asrModels = modelHost.asrModels,
+              let diarizerModel = modelHost.diarizerModel
+        else {
             micStatus = "models not loaded"
             systemStatus = "models not loaded"
             return
@@ -71,6 +74,7 @@ final class CaptureController {
                 sourceRate: m.sampleRate,
                 vad: vad,
                 asrModels: asrModels,
+                diarizerModel: diarizerModel,
                 store: transcript,
                 startWallClock: startWallClock
             )
@@ -97,6 +101,7 @@ final class CaptureController {
                 sourceRate: s.sampleRate,
                 vad: vad,
                 asrModels: asrModels,
+                diarizerModel: diarizerModel,
                 store: transcript,
                 startWallClock: startWallClock
             )

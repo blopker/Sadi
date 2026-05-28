@@ -3,6 +3,12 @@ import Foundation
 import Observation
 import OSLog
 
+// FluidAudio's LSEENDModel uses an internal NSLock to serialize predict calls
+// (see Sources/FluidAudio/Diarizer/LS-EEND/LSEENDInference.swift). It does not
+// declare Sendable, so we retroactively assert it — the lock is what makes
+// passing it from the MainActor ModelHost into the per-stream actor safe.
+extension LSEENDModel: @unchecked @retroactive Sendable {}
+
 /// Single point of truth for the FluidAudio models. Loads Silero VAD and
 /// Parakeet TDT v2 once at app start; both stream processors share the loaded
 /// weights (their decoder state is per-segment, not per-instance).
@@ -19,6 +25,7 @@ final class ModelHost {
     private(set) var state: LoadState = .idle
     private(set) var vad: VadManager?
     private(set) var asrModels: AsrModels?
+    private(set) var diarizerModel: LSEENDModel?
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "models")
 
@@ -56,8 +63,19 @@ final class ModelHost {
                 }
             )
             self.asrModels = models
+            state = .loading(fraction: 0.97, phase: "Downloading LS-EEND")
+
+            // LS-EEND streaming diarizer. dihard3 variant is the general-
+            // purpose default (vs callhome/ami). 100 ms step gives us
+            // sub-utterance frame resolution for the dominant-speaker query
+            // without being so fine that we pay extra inference cost.
+            let lseend = try await LSEENDModel.loadFromHuggingFace(
+                variant: .dihard3,
+                stepSize: .step100ms
+            )
+            self.diarizerModel = lseend
             state = .ready
-            Self.log.info("Models ready (VAD + Parakeet v2)")
+            Self.log.info("Models ready (VAD + Parakeet v2 + LS-EEND dihard3)")
         } catch {
             Self.log.error("Model load failed: \(String(describing: error), privacy: .public)")
             state = .failed(String(describing: error))

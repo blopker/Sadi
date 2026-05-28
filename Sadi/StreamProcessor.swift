@@ -17,6 +17,7 @@ actor StreamProcessor {
     private let resampler: Resampler
     private let vad: VadManager
     private let asr: AsrManager
+    private let diarizer: LSEENDDiarizer
     private let store: TranscriptStore
     private let startWallClock: Date
 
@@ -40,6 +41,7 @@ actor StreamProcessor {
         sourceRate: Double,
         vad: VadManager,
         asrModels: AsrModels,
+        diarizerModel: LSEENDModel,
         store: TranscriptStore,
         startWallClock: Date
     ) throws {
@@ -47,6 +49,7 @@ actor StreamProcessor {
         self.resampler = try Resampler(sourceRate: sourceRate, maxInputFrames: 2048)
         self.vad = vad
         self.asr = AsrManager(config: .default, models: asrModels)
+        self.diarizer = try LSEENDDiarizer(model: diarizerModel)
         self.store = store
         self.startWallClock = startWallClock
         self.streamState = VadStreamState.initial()
@@ -67,6 +70,14 @@ actor StreamProcessor {
 
         pending16k.append(contentsOf: resampled)
         let chunkSize = VadManager.chunkSize
+
+        // Feed the diarizer once per resample call — it accepts any chunk
+        // size, so we don't need the same 4096-step buffering as Silero VAD.
+        do {
+            _ = try diarizer.process(samples: resampled, sourceSampleRate: 16_000.0)
+        } catch {
+            Self.log.error("Diarize step failed: \(String(describing: error), privacy: .public)")
+        }
 
         while pending16k.count >= chunkSize {
             let chunk = Array(pending16k.prefix(chunkSize))
@@ -131,9 +142,10 @@ actor StreamProcessor {
 
             let startedAt = wallClock(forSample: absoluteStart)
             let endedAt = wallClock(forSample: absoluteEnd)
+            let speaker = resolveSpeaker(absoluteStart: absoluteStart, absoluteEnd: absoluteEnd)
             let utterance = Utterance(
                 source: source,
-                speaker: source == .mic ? .you : .them,
+                speaker: speaker,
                 text: text,
                 startedAt: startedAt,
                 endedAt: endedAt,
@@ -157,5 +169,47 @@ actor StreamProcessor {
 
     private func wallClock(forSample sample: Int64) -> Date {
         startWallClock.addingTimeInterval(Double(sample) / Resampler.targetRate)
+    }
+
+    /// SPEC §6.4: pick the speaker cluster that dominates this utterance's
+    /// time range across the diarizer's finalized + tentative segments.
+    /// Phase 5 only varies the label on the system track; mic stays `.you`.
+    private func resolveSpeaker(absoluteStart: Int64, absoluteEnd: Int64) -> SadiKit.Speaker {
+        if source == .mic { return .you }
+
+        let frameDur = Double(diarizer.modelFrameHz.map { 1 / $0 } ?? 0.1)
+        let utteranceStartSec = Double(absoluteStart) / Resampler.targetRate
+        let utteranceEndSec = Double(absoluteEnd) / Resampler.targetRate
+
+        let speakers = diarizer.timeline.speakers
+        guard !speakers.isEmpty else { return .them }
+
+        // Tally per-cluster frame overlap with [start, end).
+        var overlap: [Int: Int] = [:]
+        for (idx, speaker) in speakers {
+            let segments = speaker.finalizedSegments + speaker.tentativeSegments
+            for seg in segments {
+                let segStartSec = Double(seg.startFrame) * frameDur
+                let segEndSec = Double(seg.endFrame) * frameDur
+                let lo = max(segStartSec, utteranceStartSec)
+                let hi = min(segEndSec, utteranceEndSec)
+                if hi > lo {
+                    overlap[idx, default: 0] += Int((hi - lo) / frameDur)
+                }
+            }
+        }
+
+        guard let dominant = overlap.max(by: { $0.value < $1.value }) else {
+            return .them
+        }
+
+        // SPEC §8.1: `.them` if only one cluster has appeared; `.remote(N)`
+        // (1-indexed in display order) once there are multiple.
+        if speakers.count <= 1 {
+            return .them
+        }
+        let sortedClusterIds = speakers.keys.sorted()
+        let displayIndex = (sortedClusterIds.firstIndex(of: dominant.key) ?? 0) + 1
+        return .remote(displayIndex)
     }
 }
