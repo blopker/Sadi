@@ -548,14 +548,24 @@ Wire up the wall-clock-derived `effectiveSampleRate` in `SystemAudioCapture` and
 
 > **Implemented; not yet field-tested at 30 min.** `SystemAudioCapture.framesDelivered` (atomic, bumped in IOProc), `effectiveSampleRate(asOf:)` via `mach_timebase`. `StreamProcessor.retuneSourceRate(_:)` rebuilds the resampler if drift > 0.2%. `CaptureController`'s system consumer polls every 10 s of wall-clock. Mic skips polling — AVAudioEngine's hardware-rate query (§5.1) is already authoritative.
 
-### ⬜ Phase 10 — Crash Recovery & Polish
-"Finalize from audio" recovery action for unfinalized sessions (§10.5), pause / resume UI, "⏸ paused N min" markers in the transcript view, debug toggles for dropped utterances, settings screen, voiceprint book management UI, quit-while-recording confirmation dialog.
+### ⬜ Phase 10 — Pipeline Correctness, Crash Recovery & Data Safety
+Scoped to backend/pipeline correctness and crash safety. New data is surfaced **read-only, for debugging** — no full UI build-out here. The polished UI (Settings, voiceprint management, EchoFilter tuning, themed transcript) is deferred to a dedicated later UI phase.
 
-> Also queued from earlier phases:
+**Pipeline correctness carryovers** (highest value, no new UI):
+> - **Retroactive `.them` → `.remote(N)` relabel** when a second remote cluster appears mid-recording (Phase 5 carryover). Most self-contained; do first.
 > - **Post-session diarizer relabel pass** (Phase 7 carryover): re-query `diarizer.timeline` after Stop and rewrite past utterance labels to the now-final cluster assignments.
-> - **Retroactive `.them` → `.remote(N)` relabel** when a second remote cluster appears mid-recording (Phase 5 carryover).
-> - **Phase 6.1 fingerprint signal**: cosine-distance signal (b) against centroid voiceprints. We now have the embedding pipeline from Phase 8; the data is available.
-> - **EchoFilter parameter tuning UI**: expose `energyRatio` / `jaccardThreshold` in Settings for power users.
+> - **Phase 6.1 fingerprint signal**: cosine-distance signal (b) against centroid voiceprints in EchoFilter. We now have the embedding pipeline from Phase 8; the data is available.
+
+**Crash recovery & data safety**:
+> - **"Finalize from audio"** recovery action for unfinalized sessions (§10.5): re-run the pipeline over existing segment fMP4s to produce `transcript.json`. Pure pipeline — the offline path is already proven in `scratch/pipetest`.
+> - **Pause / resume + multi-segment writers** (§10.2): the one structural piece — splits a session into multiple `mic-NNN.mp4` / `system-NNN.mp4` segment pairs and rewrites `session.json` on each transition. Needs a single pause button; the work is in `CaptureController` / writers / `session.json` schema.
+> - **Quit-while-recording confirmation dialog**: tiny; prevents data loss.
+
+**Read-only debug surfacing** (simple, no styling):
+> - Dropped (echo-filtered) utterances shown with an "✕" + reason.
+> - "⏸ paused N min" markers in the transcript view (falls out of pause/resume).
+
+**Deferred to a later UI phase:** Settings screen, voiceprint book management UI, EchoFilter parameter tuning UI (expose `energyRatio` / `jaccardThreshold`), polished/themed transcript view.
 
 ---
 
