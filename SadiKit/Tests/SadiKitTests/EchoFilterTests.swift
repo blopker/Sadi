@@ -82,16 +82,46 @@ struct EchoFilterTests {
         #expect(filter.decide(mic: m, system: [s]) == .keep)
     }
 
-    @Test("DROP on substring containment when overlapping")
+    @Test("DROP on token-subset containment when overlapping")
     func dropsOnSubstringContainment() {
         let filter = EchoFilter()
-        // Mic transcribed a partial fragment of the system text.
+        // Mic transcribed a partial fragment of the system text — all mic
+        // tokens appear in the system token set.
         let m = mic(text: "the quick brown fox jumps", startOffset: 0)
         let s = system(
             text: "well anyway the quick brown fox jumps over the lazy dog right",
             startOffset: 0, duration: 4
         )
         #expect(filter.decide(mic: m, system: [s]) == .drop(reason: .textMatch))
+    }
+
+    @Test("KEEP when system text is too short to gate (single mangled token)")
+    func keepsWhenSystemTooShortToGate() {
+        let filter = EchoFilter()
+        // System ASR coughed out a single mangled token ("i"). Without the
+        // sys-side minimum, the old substring containment would drop any
+        // mic utterance containing the letter "i" — i.e. basically anything.
+        let m = mic(
+            text: "i think we should ship the new feature next week",
+            startOffset: 0, rms: 0.20
+        )
+        let s = system(text: "i", startOffset: 0, duration: 1, rms: 0.25)
+        #expect(filter.decide(mic: m, system: [s]) == .keep)
+    }
+
+    @Test("KEEP when system has a few real tokens that don't fully cover the mic")
+    func keepsWhenSystemBelowMinTokensAndNotASubset() {
+        let filter = EchoFilter()
+        // Three system tokens — below the minTokensForTextSignal=4 guard
+        // even though they each individually appear in the mic text.
+        // Energy ratio kept under the 3× threshold so the energy backstop
+        // doesn't fire.
+        let m = mic(
+            text: "we are going to ship the new feature next week",
+            startOffset: 0, rms: 0.20
+        )
+        let s = system(text: "ship the feature", startOffset: 0, rms: 0.40)
+        #expect(filter.decide(mic: m, system: [s]) == .keep)
     }
 
     // MARK: - Energy backstop

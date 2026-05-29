@@ -72,11 +72,20 @@ public struct EchoFilter: Sendable {
 
         for sys in overlapping {
             let sysNorm = normalize(sys.text)
-            let sysSet = Set(tokenize(sysNorm))
-            if jaccard(micSet, sysSet) >= jaccardThreshold { return true }
-            if !micNorm.isEmpty && !sysNorm.isEmpty {
-                if micNorm.contains(sysNorm) || sysNorm.contains(micNorm) { return true }
+            let sysTokens = tokenize(sysNorm)
+            // Apply the same minimum on the system side. Without this a sys
+            // utterance the ASR mangled to "i" or "uh" would substring-match
+            // any mic line containing that letter — a catastrophic false
+            // positive against normal English speech.
+            guard sysTokens.count >= minTokensForTextSignal || sysNorm.count >= minCharsForTextSignal else {
+                continue
             }
+            let sysSet = Set(sysTokens)
+            if jaccard(micSet, sysSet) >= jaccardThreshold { return true }
+            // Token-set subset (was: character substring). Catches the
+            // "ASR transcribed a fragment of the other" pattern at word
+            // granularity, immune to single-letter / partial-word matches.
+            if sysSet.isSubset(of: micSet) || micSet.isSubset(of: sysSet) { return true }
         }
         return false
     }
