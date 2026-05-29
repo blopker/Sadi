@@ -37,19 +37,32 @@ public final class SPSCRingBuffer: @unchecked Sendable {
 
     /// Called strictly by the AVAudioEngine real-time thread (Wait-free)
     public func push(data: UnsafeBufferPointer<Float>) -> Bool {
+        let n = data.count
+
         let currentWrite = writeIndex.load(ordering: .relaxed)
         let currentRead = readIndex.load(ordering: .acquiring)
 
         // Wrap-safe calculation of available space (Two's Complement)
         let availableSpace = capacity &- (currentWrite &- currentRead)
-        guard availableSpace >= data.count else { return false } // Overrun
+        guard availableSpace >= n else { return false } // Overrun
+        guard n > 0, let src = data.baseAddress else { return true }
 
-        for i in 0..<data.count {
-            buffer[(currentWrite &+ i) & mask] = data[i]
+        // Wrap-aware bulk copy: at most two `update(from:count:)` calls,
+        // which lower to memcpy for Float. Replaces a scalar masked-index
+        // loop the optimizer wasn't reliably vectorizing — material on the
+        // realtime audio thread.
+        let dst = buffer.baseAddress!
+        let writeOffset = currentWrite & mask
+        let untilWrap = capacity - writeOffset
+        if n <= untilWrap {
+            dst.advanced(by: writeOffset).update(from: src, count: n)
+        } else {
+            dst.advanced(by: writeOffset).update(from: src, count: untilWrap)
+            dst.update(from: src.advanced(by: untilWrap), count: n - untilWrap)
         }
 
         // Wrap-safe index advancement
-        writeIndex.store(currentWrite &+ data.count, ordering: .releasing)
+        writeIndex.store(currentWrite &+ n, ordering: .releasing)
         return true
     }
 
@@ -63,9 +76,17 @@ public final class SPSCRingBuffer: @unchecked Sendable {
         // Wrap-safe calculation of available data (Two's Complement)
         let availableData = currentWrite &- currentRead
         guard availableData >= count else { return false } // Underrun
+        guard count > 0, let dst = destination.baseAddress else { return true }
 
-        for i in 0..<count {
-            destination[i] = buffer[(currentRead &+ i) & mask]
+        // Wrap-aware bulk copy — symmetric with `push`.
+        let src = buffer.baseAddress!
+        let readOffset = currentRead & mask
+        let untilWrap = capacity - readOffset
+        if count <= untilWrap {
+            dst.update(from: src.advanced(by: readOffset), count: count)
+        } else {
+            dst.update(from: src.advanced(by: readOffset), count: untilWrap)
+            dst.advanced(by: untilWrap).update(from: src, count: count - untilWrap)
         }
 
         // Wrap-safe index advancement

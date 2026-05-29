@@ -53,4 +53,25 @@ struct SPSCRingBufferTests {
             #expect(scratch == input)
         }
     }
+
+    @Test("single push and pull span the wrap boundary correctly")
+    func singleCallSpansWrap() {
+        // Capacity 8; advance write+read to offset 6, then push 5 samples in
+        // one call so the bulk-copy fast path splits 2 before the wrap and
+        // 3 after. Exercises the two-memcpy branch of push() and pull().
+        let ring = SPSCRingBuffer(capacity: 8)
+        var warmupOut = [Float](repeating: 0, count: 6)
+        let warmup: [Float] = [1, 2, 3, 4, 5, 6]
+        #expect(warmup.withUnsafeBufferPointer { ring.push(data: $0) })
+        #expect(warmupOut.withUnsafeMutableBufferPointer { ring.pull(count: 6, into: $0) })
+
+        // Now writeOffset and readOffset both at 6. Push 5 samples that
+        // wrap: positions 6, 7, 0, 1, 2.
+        let crossing: [Float] = [10, 20, 30, 40, 50]
+        #expect(crossing.withUnsafeBufferPointer { ring.push(data: $0) })
+
+        var out = [Float](repeating: 0, count: 5)
+        #expect(out.withUnsafeMutableBufferPointer { ring.pull(count: 5, into: $0) })
+        #expect(out == crossing)
+    }
 }
