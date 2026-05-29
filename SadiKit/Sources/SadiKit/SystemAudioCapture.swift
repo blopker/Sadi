@@ -140,10 +140,16 @@ public final class SystemAudioCapture: @unchecked Sendable {
         firstHostTimeAtomic.store(0, ordering: .releasing)
 
         var proc: AudioDeviceIOProcID?
+        // Weak self: CoreAudio retains the IOProc block for the lifetime of
+        // the installed handle (only freed by AudioDeviceDestroyIOProcID).
+        // A strong capture would form a permanent cycle and make `deinit`
+        // unreachable. The `guard let self` upgrade pins self for the
+        // duration of one callback so the atomics and ring access are safe.
         let s1 = AudioDeviceCreateIOProcIDWithBlock(
             &proc, aggregateID, nil
-        ) { [self] _, inInputData, inInputTime, _, _ in
+        ) { [weak self] _, inInputData, inInputTime, _, _ in
             // Realtime CoreAudio thread: ring.push only.
+            guard let self else { return }
             let listPtr = UnsafeMutableAudioBufferListPointer(
                 UnsafeMutablePointer(mutating: inInputData)
             )

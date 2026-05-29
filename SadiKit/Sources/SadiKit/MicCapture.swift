@@ -53,10 +53,16 @@ public final class MicCapture: @unchecked Sendable {
         let input = engine.inputNode
         let nativeFormat = input.outputFormat(forBus: 0)
 
-        // Atomic<UInt64> is ~Copyable so we can't bind it to a local; capture
-        // self instead (already Sendable) and reach through.
-        input.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [self] buffer, when in
+        // Atomic<UInt64> is ~Copyable so we can't bind it to a local; reach
+        // through `self` instead. Capture WEAKLY: AVAudioEngine retains the
+        // tap block, the block would otherwise retain self, and self owns
+        // the engine — a permanent cycle that prevents `deinit` from ever
+        // running unless `stop()` is called explicitly. The `guard let self`
+        // upgrade temporarily holds self alive for the duration of one
+        // callback so the atomics + ring access are safe.
+        input.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, when in
             // Realtime thread: no allocation, no locks, no logging, no ObjC.
+            guard let self else { return }
             guard let channels = buffer.floatChannelData else { return }
             let frames = Int(buffer.frameLength)
             if frames == 0 { return }
@@ -85,6 +91,15 @@ public final class MicCapture: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         isRunning = false
+    }
+
+    deinit {
+        // Best-effort teardown if the user forgot `stop()`. Once the tap
+        // closure captures self weakly, this path is actually reachable.
+        if isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
     }
 
     // MARK: - Helpers
