@@ -21,11 +21,20 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     private let input: AVAssetWriterInput
     private let format: CMAudioFormatDescription
     private let sampleRate: Double
+    /// Nanoseconds per source-rate frame, pre-computed at init. Used to
+    /// build a PTS in a nanosecond-precision CMTime so that a fractional
+    /// `sampleRate` (e.g., a Phase 9 effective rate of 48000.15 Hz) does
+    /// not get rounded out by `CMTimeScale`'s Int32 conversion — that
+    /// truncation would otherwise accumulate into MP4 duration drift over
+    /// a long meeting.
+    private let nanosPerFrame: Double
+    private static let nanosecondTimescale: CMTimeScale = 1_000_000_000
     private var framesWritten: Int64 = 0
     private var didStart = false
 
     public init(url: URL, sampleRate: Double) throws {
         self.sampleRate = sampleRate
+        self.nanosPerFrame = 1_000_000_000.0 / sampleRate
 
         // Source PCM format: Float32 mono, packed, native endian. This is the
         // format of buffers we hand to `append(_:)`; AVAssetWriter transcodes
@@ -127,7 +136,11 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
             throw Error.blockBufferCreationFailed(copyStatus)
         }
 
-        let pts = CMTime(value: framesWritten, timescale: CMTimeScale(sampleRate))
+        // Nanosecond-precision PTS: `value` stays in Double so fractional
+        // sample rates round only at the ns floor (sub-microsecond), which
+        // can't accumulate over any practical session length.
+        let ptsValue = Int64((Double(framesWritten) * nanosPerFrame).rounded())
+        let pts = CMTime(value: ptsValue, timescale: SegmentArchiveWriter.nanosecondTimescale)
         var sampleBuffer: CMSampleBuffer?
         let sbStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
             allocator: kCFAllocatorDefault,
