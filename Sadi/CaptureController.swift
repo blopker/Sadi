@@ -83,9 +83,15 @@ final class CaptureController {
             try m.start()
             mic = m
             micStatus = "running @ \(Int(m.sampleRate)) Hz"
-            micConsumer = consume(ring: m.ring, writer: writer, processor: proc) { [weak self] level in
-                self?.micLevel = level
-            }
+            micConsumer = consume(
+                ring: m.ring,
+                writer: writer,
+                processor: proc,
+                rateSource: nil,
+                publish: { [weak self] level in
+                    self?.micLevel = level
+                }
+            )
         } catch {
             micStatus = "failed: \(error)"
             Self.log.error("Mic start failed: \(String(describing: error), privacy: .public)")
@@ -111,9 +117,15 @@ final class CaptureController {
             try s.start()
             system = s
             systemStatus = "running @ \(Int(s.sampleRate)) Hz"
-            systemConsumer = consume(ring: s.ring, writer: writer, processor: proc) { [weak self] level in
-                self?.systemLevel = level
-            }
+            systemConsumer = consume(
+                ring: s.ring,
+                writer: writer,
+                processor: proc,
+                rateSource: s,
+                publish: { [weak self] level in
+                    self?.systemLevel = level
+                }
+            )
         } catch {
             systemStatus = "failed: \(error)"
             Self.log.error("System start failed: \(String(describing: error), privacy: .public)")
@@ -143,10 +155,16 @@ final class CaptureController {
         ring: SPSCRingBuffer,
         writer: SegmentArchiveWriter,
         processor: StreamProcessor,
+        rateSource: SystemAudioCapture?,
         publish: @escaping @MainActor (Float) -> Void
     ) -> Task<Void, Never> {
         Task.detached(priority: .userInitiated) {
             var scratch = [Float](repeating: 0, count: 1024)
+            // SPEC §5.2: re-measure system's effective sample rate every
+            // ~10 s of wall-clock time. Time-based so it works the same
+            // regardless of source-rate / pull-size.
+            let rateCheckIntervalSec: Double = 10
+            var lastRateCheckHostTime: UInt64 = mach_absolute_time()
             while !Task.isCancelled {
                 let pulled = scratch.withUnsafeMutableBufferPointer { buf in
                     ring.pull(count: buf.count, into: buf)
@@ -171,6 +189,20 @@ final class CaptureController {
                 for v in scratch { sumSq += v * v }
                 let rms = (sumSq / Float(scratch.count)).squareRoot()
                 await publish(rms)
+
+                // Periodic effective-rate measurement for the system tap.
+                if let rateSource {
+                    let now = mach_absolute_time()
+                    let elapsed = SystemAudioCapture.hostTimeSeconds(
+                        from: lastRateCheckHostTime, to: now
+                    )
+                    if elapsed >= rateCheckIntervalSec {
+                        lastRateCheckHostTime = now
+                        if let measured = rateSource.effectiveSampleRate(asOf: now) {
+                            await processor.retuneSourceRate(measured)
+                        }
+                    }
+                }
             }
             await writer.finalize()
         }

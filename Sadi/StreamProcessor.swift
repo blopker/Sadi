@@ -14,7 +14,8 @@ import SadiKit
 /// `.speechStart` / `.speechEnd` events.
 actor StreamProcessor {
     private let source: Source
-    private let resampler: Resampler
+    private var resampler: Resampler
+    private var resamplerSourceRate: Double
     private let vad: VadManager
     private let asr: AsrManager
     private let diarizer: LSEENDDiarizer
@@ -49,6 +50,7 @@ actor StreamProcessor {
     ) throws {
         self.source = source
         self.resampler = try Resampler(sourceRate: sourceRate, maxInputFrames: 2048)
+        self.resamplerSourceRate = sourceRate
         self.vad = vad
         self.asr = AsrManager(config: .default, models: asrModels)
         self.diarizer = try LSEENDDiarizer(model: diarizerModel)
@@ -56,6 +58,27 @@ actor StreamProcessor {
         self.store = store
         self.startWallClock = startWallClock
         self.streamState = VadStreamState.initial()
+    }
+
+    /// SPEC §5.2: retune the resampler when the source's effective sample
+    /// rate has drifted from the nominal rate the resampler was built for.
+    /// Threshold of 0.2% picks up the kind of long-term drift CoreAudio
+    /// process taps exhibit without thrashing on micro-jitter. The 16 kHz
+    /// downstream state (VAD stream, ASR window, diarizer timeline) is
+    /// untouched because the *output* rate is unchanged.
+    func retuneSourceRate(_ measuredRate: Double, threshold: Double = 0.002) {
+        guard measuredRate > 0 else { return }
+        let relativeDelta = abs(measuredRate - resamplerSourceRate) / resamplerSourceRate
+        guard relativeDelta > threshold else { return }
+        do {
+            self.resampler = try Resampler(sourceRate: measuredRate, maxInputFrames: 2048)
+            Self.log.info(
+                "Retuned \(self.source == .mic ? "mic" : "system") resampler: \(self.resamplerSourceRate, format: .fixed(precision: 2)) Hz → \(measuredRate, format: .fixed(precision: 2)) Hz (Δ \(relativeDelta * 100, format: .fixed(precision: 3))%)"
+            )
+            self.resamplerSourceRate = measuredRate
+        } catch {
+            Self.log.error("Resampler retune failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Feed a chunk of source-rate Float32 mono samples (the same chunk the

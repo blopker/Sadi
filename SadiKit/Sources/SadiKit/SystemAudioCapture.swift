@@ -31,6 +31,7 @@ public final class SystemAudioCapture: @unchecked Sendable {
     public let sampleRate: Double
 
     private let firstHostTimeAtomic = Atomic<UInt64>(0)
+    private let framesDeliveredAtomic = Atomic<UInt64>(0)
     private var tapID: AudioObjectID = 0
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
@@ -39,6 +40,40 @@ public final class SystemAudioCapture: @unchecked Sendable {
     public var firstHostTime: UInt64? {
         let raw = firstHostTimeAtomic.load(ordering: .acquiring)
         return raw == 0 ? nil : raw
+    }
+
+    /// Total frames the IOProc has pushed into the ring since `start()`. Used
+    /// by the consumer side to compute the effective sample rate (SPEC §5.2)
+    /// — CoreAudio process taps frequently deliver slightly off-nominal.
+    public var framesDelivered: UInt64 {
+        framesDeliveredAtomic.load(ordering: .acquiring)
+    }
+
+    /// Wall-clock-derived delivered rate: `framesDelivered / secondsSinceFirstHost`.
+    /// Returns nil until the first IOProc callback has run. SPEC §5.2 trick:
+    /// re-tune the resampler when this drifts from the nominal rate over a
+    /// long session so mic and system stay aligned.
+    public func effectiveSampleRate(asOf hostTime: UInt64) -> Double? {
+        guard let first = firstHostTime, hostTime > first else { return nil }
+        let elapsedSec = SystemAudioCapture.hostTimeSeconds(from: first, to: hostTime)
+        guard elapsedSec > 0 else { return nil }
+        let frames = framesDelivered
+        guard frames > 0 else { return nil }
+        return Double(frames) / elapsedSec
+    }
+
+    private nonisolated(unsafe) static var cachedTimebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    public static func hostTimeSeconds(from start: UInt64, to end: UInt64) -> Double {
+        guard end >= start else { return 0 }
+        let delta = end - start
+        let info = cachedTimebase
+        let ns = Double(delta) * Double(info.numer) / Double(info.denom)
+        return ns / 1_000_000_000
     }
 
     public init() throws {
@@ -124,6 +159,10 @@ public final class SystemAudioCapture: @unchecked Sendable {
                 desired: inInputTime.pointee.mHostTime,
                 ordering: .acquiringAndReleasing
             )
+            // SPEC §5.2: bump delivered-frame counter so the consumer side
+            // can compute the effective sample rate without touching the
+            // realtime thread for any locks/allocations.
+            framesDeliveredAtomic.add(UInt64(frames), ordering: .relaxed)
         }
         guard s1 == noErr, let proc else { throw Error.ioProcCreationFailed(s1) }
         self.ioProcID = proc

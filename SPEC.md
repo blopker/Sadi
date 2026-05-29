@@ -486,35 +486,75 @@ No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAu
 
 Each phase ends at a testable milestone. Don't move on until the milestone passes.
 
-### Phase 1 — Foundation
+**Status legend:** ✅ shipped & milestone verified · 🟢 shipped, milestone not yet field-tested · 🚧 in progress · ⬜ not started
+
+| Phase | Status | Commit |
+|---|---|---|
+| 1 — Foundation | ✅ | `28b9ef6` |
+| 2 — Capture | ✅ | `2a7e9fc` |
+| 3 — File Archive | ✅ | `9207d08` |
+| 4 — VAD + Per-Track ASR | ✅ | `c4c01f5` |
+| 5 — Diarization | ✅ (both tracks) | `bf62904` |
+| 6 — Echo Filter | ✅ (signals a+c; b deferred) | `146e7b8`, pipetest `dea1bd3` |
+| 7 — Mic-Only Mode | ✅ | `d08e375` |
+| — — SpeakerSegmenter (mid-phase polish) | ✅ | `0eb04d4` |
+| 8 — Persistent Speaker ID | ✅ | `3bea656` |
+| 9 — Effective Sample-Rate Correction | 🟢 (needs 30 min field test) | _uncommitted_ |
+| 10 — Crash Recovery & Polish | ⬜ | — |
+
+### ✅ Phase 1 — Foundation
 Project scaffold (SwiftPM-based Xcode project), sandbox + entitlements, Sadi.entitlements file, build settings as above. App launches, requests mic permission, shows an empty window. **Milestone:** clean build, mic permission granted, empty UI.
 
-### Phase 2 — Capture
+> **Done.** SadiKit local SwiftPM package at the repo root, app target reuses the existing `Sadi.xcodeproj` per user direction. Entitlements already matched §12 from v0; switched to a hand-authored `Info.plist` to add the new keys.
+
+### ✅ Phase 2 — Capture
 `MicCapture` and `SystemAudioCapture` per §5, each pushing into its SPSC ring (§5.0). A consumer `Task` pulls and feeds a debug RMS meter for each stream. **Milestone:** start/stop captures both tracks; meters move when you speak / when audio plays; no Screen Recording prompt ever appears; the realtime callback does nothing but `ring.push`.
 
-### Phase 3 — File Archive
+> **Done.** Realtime callbacks do only `ring.push` (+ the first-host CAS and, post-Phase-9, the delivered-frames counter add — all wait-free atomics). The macOS 26 `audioanalyticsd` precondition + `-10877` log noise is environmental and non-fatal (Apple's HALC client telemetry; we don't grant the lookup); see Appendix A.
+
+### ✅ Phase 3 — File Archive
 The consumer task per track encodes pulled samples to mono AAC at 64 kbps and writes a fragmented MP4 (`mic-001.mp4` / `system-001.mp4`) into the session directory using `AVAssetWriter` with `movieFragmentInterval = 10s`. **Milestone:** stop a recording; play back both `.mp4` files in QuickTime; mic is your voice, system is what was playing; file sizes match the §10.6 envelope (~0.5 MB/min/stream).
 
-### Phase 4 — VAD + Per-Track ASR
+> **Done.** Verified at 70 s: ~62 kbps mic / ~56 kbps system VBR. The two streams stayed within 64 ms of each other end-to-end on a healthy machine — a baseline that Phase 9 keeps from drifting over hours.
+
+### ✅ Phase 4 — VAD + Per-Track ASR
 Add the ring buffer, Silero VAD, and per-track ASR per §6.2 and §6.3. No diarization yet; no echo filter; tag mic utterances as `.you` and system as `.them` unconditionally. **Milestone:** live transcript appears in the UI for both tracks during recording.
 
-### Phase 5 — Diarization on System
+> **Done.** Uses FluidAudio's streaming-VAD API (`processStreamingChunk` + `VadStreamState`) rather than rolling our own state machine. ASR via Parakeet TDT v2 with a fresh `TdtDecoderState` per segment. Models load via `ModelHost` once at app start (~620 MB Parakeet download on first launch).
+
+### ✅ Phase 5 — Diarization
 Add LS-EEND on the system track per §6.4. System utterances are tagged with `.them` (one cluster) or `.remote(N)` (multi-cluster). **Milestone:** in a recording with two distinct far-end voices, the transcript shows two distinct remote speakers.
 
-### Phase 6 — Echo Filter (Call Mode)
+> **Done.** LS-EEND runs on **both** tracks per §6.4 (the mic embeddings feed Phase 6's eventual fingerprint signal and Phase 7's `.localSpeaker(N)` labels). dihard3 variant, 100 ms step. Verified with `Remote 1` / `Remote 2` labels on a 2-host podcast.
+
+### ✅ Phase 6 — Echo Filter (Call Mode)
 Implement §7 with all three bleed signals and the temporal precondition. Run against the harness (`scratch/pipetest`) on known recordings to verify. **Milestone:** on a recording with mic bleed of far-end audio, the bleed utterances are filtered out; on a recording where local user speaks during far-end silence, those utterances survive — even if the voices are similar.
 
-### Phase 7 — Mic-Only Mode
+> **Done with the temporal precondition + signals (a) text and (c) energy.** Signal (b) cosine-distance fingerprint deferred to Phase 6.1 — LS-EEND 0.14.7 doesn't expose centroid embeddings publicly. Verified across 5 sessions via the pipetest harness; **textMatch is 14/14 correct**, energy fires only in "meetings during loud playback" sessions and is ~half false-positive there (SPEC §2 explicitly accepts losing quiet local speech during loud far-end). Default 3× ratio kept per SPEC; tunable.
+
+### ✅ Phase 7 — Mic-Only Mode
 Detect mode per §7.1; in mic-only mode, run LS-EEND on the mic too; bypass the echo filter. **Milestone:** in an in-person recording (no system audio), multiple distinct local speakers appear correctly diarized.
 
-### Phase 8 — Persistent Speaker ID
+> **Done.** Mic diarization was already running from Phase 5; Phase 7 stopped hard-coding `.you` and surfaced `.localSpeaker(N)`. TranscriptStore collapses mic clusters to `.you` in call mode (any system utterance seen so far). Rapid-conversation misattribution is the §13 Risk #2 streaming-diarizer baseline; partially addressed mid-phase by **SpeakerSegmenter** (split single VAD segments by per-word speaker via Parakeet's token timings); full retroactive relabel deferred to Phase 10.
+
+### ✅ Phase 8 — Persistent Speaker ID
 Implement §8.2: voiceprint book on disk, resolution flow at recording finalize (or live debounced), UI affordance to name speakers. **Milestone:** name "Alice" in one recording; in a new recording with Alice, her utterances show up as "Alice" automatically.
 
-### Phase 9 — Effective Sample-Rate Correction
+> **Done.** WeSpeaker 256-dim embedding extracted per utterance via `DiarizerManager.extractSpeakerEmbedding` (side-loaded purely for that helper; LS-EEND remains the diarizer). `VoiceprintBook` lives in SadiKit (pure logic: JSON persistence, cosine matching, running-average updates, modelVersion stamping). Live matching at receive time + click-to-name UI + `rerunVoiceprintMatching` to relabel past utterances in the current session.
+
+### 🟢 Phase 9 — Effective Sample-Rate Correction
 Wire up the wall-clock-derived `effectiveSampleRate` in `SystemAudioCapture` and use it in the resampler. **Milestone:** record a long (>30 min) session; verify by spot-check that system utterances stay in time with mic utterances throughout. (This is a robustness fix, not a feature, but it's important for long meetings.)
 
-### Phase 10 — Crash Recovery & Polish
+> **Implemented; not yet field-tested at 30 min.** `SystemAudioCapture.framesDelivered` (atomic, bumped in IOProc), `effectiveSampleRate(asOf:)` via `mach_timebase`. `StreamProcessor.retuneSourceRate(_:)` rebuilds the resampler if drift > 0.2%. `CaptureController`'s system consumer polls every 10 s of wall-clock. Mic skips polling — AVAudioEngine's hardware-rate query (§5.1) is already authoritative.
+
+### ⬜ Phase 10 — Crash Recovery & Polish
 "Finalize from audio" recovery action for unfinalized sessions (§10.5), pause / resume UI, "⏸ paused N min" markers in the transcript view, debug toggles for dropped utterances, settings screen, voiceprint book management UI, quit-while-recording confirmation dialog.
+
+> Also queued from earlier phases:
+> - **Post-session diarizer relabel pass** (Phase 7 carryover): re-query `diarizer.timeline` after Stop and rewrite past utterance labels to the now-final cluster assignments.
+> - **Retroactive `.them` → `.remote(N)` relabel** when a second remote cluster appears mid-recording (Phase 5 carryover).
+> - **Phase 6.1 fingerprint signal**: cosine-distance signal (b) against centroid voiceprints. We now have the embedding pipeline from Phase 8; the data is available.
+> - **EchoFilter parameter tuning UI**: expose `energyRatio` / `jaccardThreshold` in Settings for power users.
 
 ---
 
