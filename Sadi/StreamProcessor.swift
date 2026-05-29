@@ -179,6 +179,7 @@ actor StreamProcessor {
                     runStartSample: absoluteStart,
                     runEndSample: absoluteEnd,
                     speaker: speaker,
+                    cluster: cluster,
                     confidence: result.confidence
                 )
                 return
@@ -217,6 +218,7 @@ actor StreamProcessor {
                     runStartSample: runStartSample,
                     runEndSample: runEndSample,
                     speaker: speaker,
+                    cluster: run.speakerIndex,
                     confidence: result.confidence
                 )
             }
@@ -232,6 +234,7 @@ actor StreamProcessor {
         runStartSample: Int64,
         runEndSample: Int64,
         speaker: SadiKit.Speaker,
+        cluster: Int?,
         confidence: Float?
     ) async {
         var sumSq: Float = 0
@@ -252,7 +255,8 @@ actor StreamProcessor {
             endedAt: wallClock(forSample: runEndSample),
             embedding: embedding,
             asrConfidence: confidence,
-            rms: rms
+            rms: rms,
+            diarCluster: cluster
         )
         await store.receive(utterance)
     }
@@ -328,21 +332,23 @@ actor StreamProcessor {
         return nil
     }
 
-    /// Visible-label mapping for a cluster id, mirroring resolveSpeaker's
-    /// case logic but parameterized so the run loop can call it once per
-    /// run instead of once per utterance.
+    /// Visible-label mapping for a cluster id.
+    ///
+    /// System utterances get a `.them` placeholder only: `TranscriptStore` is
+    /// the authority for the final `.them` vs `.remote(N)` numbering because
+    /// it sees the full set of emitted clusters and can retroactively relabel
+    /// earlier utterances when a second remote cluster first speaks (SPEC §13
+    /// Phase 10). The raw cluster id rides along on `Utterance.diarCluster`.
+    /// Mic-only multi-speaker numbering (`.localSpeaker(N)`) stays here — there
+    /// is no cross-utterance relabel for it in this phase.
     private func label(source: Source, cluster: Int?) -> SadiKit.Speaker {
-        let speakers = diarizer.timeline.speakers
-        let sortedClusterIds = speakers.keys.sorted()
         switch source {
         case .system:
-            guard !speakers.isEmpty, let cid = cluster else { return .them }
-            if speakers.count <= 1 { return .them }
-            let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
-            return .remote(displayIndex)
+            return .them
         case .mic:
+            let speakers = diarizer.timeline.speakers
             guard !speakers.isEmpty, let cid = cluster else { return .localSpeaker(1) }
-            let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
+            let displayIndex = (speakers.keys.sorted().firstIndex(of: cid) ?? 0) + 1
             return .localSpeaker(displayIndex)
         }
     }

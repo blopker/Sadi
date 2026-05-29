@@ -15,6 +15,13 @@ final class TranscriptStore {
     private let filter = EchoFilter()
     private let voiceprints: VoiceprintBook
 
+    /// Distinct diarizer cluster ids seen across system utterances so far.
+    /// The visible `.them` / `.remote(N)` numbering is derived from this set
+    /// (SPEC §13 Phase 10): one distinct cluster → everyone is `.them`; two or
+    /// more → `.remote(rank+1)` by sorted cluster id. When a brand-new cluster
+    /// first speaks, ranks shift and earlier utterances are relabeled.
+    private var seenSystemClusters: Set<Int> = []
+
     init(voiceprints: VoiceprintBook) {
         self.voiceprints = voiceprints
     }
@@ -27,7 +34,25 @@ final class TranscriptStore {
     func receive(_ utterance: Utterance) {
         if utterance.source == .system {
             systemLog.append(utterance)
-            utterances.append(resolveVoiceprint(utterance))
+            // StreamProcessor emits a `.them` placeholder; this store owns the
+            // final `.them` vs `.remote(N)` numbering (SPEC §13 Phase 10).
+            let newCluster: Bool
+            if let c = utterance.diarCluster, !seenSystemClusters.contains(c) {
+                seenSystemClusters.insert(c)
+                newCluster = true
+            } else {
+                newCluster = false
+            }
+            utterances.append(utterance)
+            if newCluster {
+                // A previously-unseen remote cluster: ranks may have shifted
+                // (e.g. .them → .remote(1) once a second speaker appears), so
+                // re-derive every system utterance's label.
+                relabelSystemSpeakers()
+            } else {
+                let i = utterances.count - 1
+                utterances[i] = labelSystemUtterance(utterances[i], distinct: seenSystemClusters)
+            }
             return
         }
         if systemLog.isEmpty {
@@ -60,10 +85,30 @@ final class TranscriptStore {
         return copy
     }
 
+    /// Re-derive `.them` / `.remote(N)` for every system utterance from the
+    /// current `seenSystemClusters` set, then re-apply voiceprint resolution
+    /// (which can override the cluster label with a persistent `.named`).
+    /// Only system utterances are touched; mic labels are left as-is.
+    private func relabelSystemSpeakers() {
+        utterances = utterances.map { u in
+            u.source == .system ? labelSystemUtterance(u, distinct: seenSystemClusters) : u
+        }
+    }
+
+    /// Cluster-derived label for one system utterance, with voiceprint
+    /// resolution layered on top. `distinct` is the set of cluster ids seen
+    /// across all system utterances.
+    private func labelSystemUtterance(_ u: Utterance, distinct: Set<Int>) -> Utterance {
+        var copy = u
+        copy.speaker = .remoteLabel(forCluster: u.diarCluster, among: distinct)
+        return resolveVoiceprint(copy)
+    }
+
     func reset() {
         utterances.removeAll()
         dropped.removeAll()
         systemLog.removeAll()
+        seenSystemClusters.removeAll()
     }
 
     /// Re-resolve every existing utterance against the current voiceprint

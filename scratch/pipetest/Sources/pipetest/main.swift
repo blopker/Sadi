@@ -174,25 +174,36 @@ func parseSessionStart(from id: String) -> Date {
 // lives in the app target (where FluidAudio is wired) and pipetest is a
 // standalone executable.
 
-/// Map a cluster id to the visible speaker label (.them/.remote on system,
-/// .localSpeaker on mic). Display index is 1-based in cluster-id sort order.
+/// Map a cluster id to the visible speaker label. MIRRORS the live
+/// `StreamProcessor.label`: system gets a `.them` placeholder only — final
+/// `.them`/`.remote(N)` numbering is derived later from the set of clusters
+/// across all system utterances (see `labelSystemUtterances`, mirroring
+/// TranscriptStore). Mic-only multi-speaker numbering stays here.
 func speakerLabelFor(
     source: Source,
     clusterID: Int?,
     timeline: DiarizerTimeline
 ) -> SadiKit.Speaker {
-    let speakers = timeline.speakers
-    let sortedClusterIds = speakers.keys.sorted()
     switch source {
     case .system:
-        guard !speakers.isEmpty, let cid = clusterID else { return .them }
-        if speakers.count <= 1 { return .them }
-        let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
-        return .remote(displayIndex)
+        return .them
     case .mic:
+        let speakers = timeline.speakers
         guard !speakers.isEmpty, let cid = clusterID else { return .localSpeaker(1) }
-        let displayIndex = (sortedClusterIds.firstIndex(of: cid) ?? 0) + 1
+        let displayIndex = (speakers.keys.sorted().firstIndex(of: cid) ?? 0) + 1
         return .localSpeaker(displayIndex)
+    }
+}
+
+/// MIRROR of TranscriptStore's system relabel: derive `.them`/`.remote(N)`
+/// from the distinct diarizer clusters seen across all system utterances.
+/// One distinct cluster → `.them`; two or more → `.remote(rank+1)`.
+func labelSystemUtterances(_ system: [Utterance]) -> [Utterance] {
+    let distinct = Set(system.compactMap { $0.diarCluster })
+    return system.map { u in
+        var copy = u
+        copy.speaker = .remoteLabel(forCluster: u.diarCluster, among: distinct)
+        return copy
     }
 }
 
@@ -443,7 +454,8 @@ func buildUtterance(
         endedAt: sessionStart.addingTimeInterval(runEndSec),
         embedding: embedding,
         asrConfidence: confidence,
-        rms: rms
+        rms: rms,
+        diarCluster: cluster
     )
 }
 
@@ -527,11 +539,14 @@ struct PipeTest {
         )
 
         // 3. Cross-track: call mode, echo filter, voiceprint match.
-        let allUtterances = (micResult.utterances + sysResult.utterances)
+        // Derive final system `.them`/`.remote(N)` numbering from the full set
+        // of system clusters (mirrors TranscriptStore's retroactive relabel).
+        let systemLabeled = labelSystemUtterances(sysResult.utterances)
+        let allUtterances = (micResult.utterances + systemLabeled)
             .sorted { $0.startedAt < $1.startedAt }
-        let callMode = !sysResult.utterances.isEmpty
+        let callMode = !systemLabeled.isEmpty
         let filter = EchoFilter()
-        let systemAll = sysResult.utterances
+        let systemAll = systemLabeled
 
         var kept: [Utterance] = []
         var dropped: [(Utterance, EchoFilter.DropReason)] = []
