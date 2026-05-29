@@ -98,7 +98,10 @@ public final class SystemAudioCapture: @unchecked Sendable {
         let tapUID = try SystemAudioCapture.readString(tap, kAudioTapPropertyUID)
         let format = try SystemAudioCapture.readFormat(tap)
         self.sampleRate = format.mSampleRate
-        let cap = SystemAudioCapture.nextPowerOfTwo(Int(format.mSampleRate.rounded(.up)))
+        // ~5 s of source-rate audio (~1 MB). See MicCapture.init for the
+        // sizing rationale — long ASR + embedding stalls would otherwise
+        // overflow a 1-second ring during normal operation.
+        let cap = SystemAudioCapture.nextPowerOfTwo(Int(format.mSampleRate.rounded(.up)) * 5)
         self.ring = SPSCRingBuffer(capacity: cap)
 
         // 3. Aggregate device wrapping just our tap, with drift comp on.

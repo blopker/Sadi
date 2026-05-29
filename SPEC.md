@@ -122,7 +122,7 @@ Both capture sources (AVAudioEngine input tap, CoreAudio IOProc) invoke their ca
 
 A reference implementation lives at `Sadi/SPSCRingBuffer.swift`: power-of-two capacity, monotonic indices with mask-on-access, release/acquire memory ordering, `Float` samples, `@unchecked Sendable`. Producer = the realtime thread; consumer = a long-running `Task` on a normal-priority queue. The consumer side is where all resampling, file writing, VAD, ASR, and diarization happen.
 
-Capacity per ring: sized for the maximum tolerated end-to-end consumer latency, e.g. 1 second of source-rate float = 192 KB at 48 kHz mono. Two streams → ~400 KB total, lives for the duration of a recording.
+Capacity per ring: sized for the maximum tolerated end-to-end consumer latency. The consumer's `await processor.feed(...)` blocks while the per-track actor runs ASR transcribe + WeSpeaker embedding, both of which can spike past a second on a busy machine — so we currently allocate **~5 seconds of source-rate audio** (`nextPowerOfTwo(rate * 5)` ≈ 262144 samples ≈ 1 MB at 48 kHz mono). Two streams → ~2 MB total, lives for the duration of a recording. The 1 s baseline the original spec proposed proved tight under real load; 5 s gives the actor wiggle room without changing steady-state latency (the consumer drains backlogs quickly once unblocked).
 
 ### 5.1 Microphone Capture (`MicCapture`)
 

@@ -41,8 +41,13 @@ public final class MicCapture: @unchecked Sendable {
     public init() throws {
         let hw = try MicCapture.hardwareInputSampleRate()
         self.sampleRate = hw
-        // SPEC §5.0: ~1 s of source-rate audio. Round up to next power of 2.
-        let cap = MicCapture.nextPowerOfTwo(Int(hw.rounded(.up)))
+        // SPEC §5.0 budgets "~1 s" but the realistic stall on the consumer
+        // side is `await processor.feed(...)` blocking while the per-track
+        // actor runs ASR transcribe + WeSpeaker embedding for a long
+        // segment — both can spike past a second on a busy machine. Size
+        // at ~5 s of source-rate audio (~1 MB) so transient stalls don't
+        // overflow the ring and drop samples on the archive + ASR paths.
+        let cap = MicCapture.nextPowerOfTwo(Int(hw.rounded(.up)) * 5)
         self.ring = SPSCRingBuffer(capacity: cap)
     }
 
