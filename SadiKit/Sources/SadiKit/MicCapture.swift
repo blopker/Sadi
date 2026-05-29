@@ -53,14 +53,27 @@ public final class MicCapture: @unchecked Sendable {
         let input = engine.inputNode
         let nativeFormat = input.outputFormat(forBus: 0)
 
-        // Atomic<UInt64> is ~Copyable so we can't bind it to a local; reach
-        // through `self` instead. Capture WEAKLY: AVAudioEngine retains the
-        // tap block, the block would otherwise retain self, and self owns
-        // the engine — a permanent cycle that prevents `deinit` from ever
-        // running unless `stop()` is called explicitly. The `guard let self`
-        // upgrade temporarily holds self alive for the duration of one
-        // callback so the atomics + ring access are safe.
-        input.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, when in
+        // SPEC §5.1: pin the tap rate to the hardware nominal rate we
+        // resolved at init (`self.sampleRate`). `inputNode.outputFormat`
+        // can lag the hardware after device switches; if we install the
+        // tap at `nativeFormat` the ring buffer would carry samples at a
+        // rate that disagrees with `self.sampleRate`, and every consumer
+        // (resampler, AAC writer, host-time math) would be mis-clocked —
+        // pitch-shifted output and accumulating drift. AVAudioEngine
+        // inserts an internal sample-rate conversion when the tap format
+        // differs from the bus format, so this stays correct even mid-lag.
+        // Channels stay native so the channel-0 extract still has a
+        // multi-channel buffer to work with.
+        guard let tapFormat = AVAudioFormat(
+            commonFormat: nativeFormat.commonFormat,
+            sampleRate: sampleRate,
+            channels: nativeFormat.channelCount,
+            interleaved: nativeFormat.isInterleaved
+        ) else {
+            throw Error.sampleRateUnavailable
+        }
+
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, when in
             // Realtime thread: no allocation, no locks, no logging, no ObjC.
             guard let self else { return }
             guard let channels = buffer.floatChannelData else { return }
