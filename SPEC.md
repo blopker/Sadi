@@ -2,7 +2,7 @@
 
 A fully on-device macOS meeting transcriber, designed to be rebuilt from scratch against this document. Targets macOS 26+, Apple Silicon, sandboxed.
 
-> 📎 **See `HANDOFF.md` for current repo state, files on disk, and decisions already made.** This document is the design; `HANDOFF.md` is the operational context.
+> 📎 **§13 carries the current implementation status** for each phase along with the landing commit. Detailed change history lives in `git log`.
 
 ---
 
@@ -456,11 +456,12 @@ The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `Transc
 
 No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAudio handles.
 
-### Entitlements (`Sadi.entitlements`)
-- `com.apple.security.app-sandbox` = true
-- `com.apple.security.device.audio-input` = true
-- `com.apple.security.network.client` = true (for FluidAudio one-time model download)
-- `com.apple.security.files.user-selected.read-only` = true (for any "import audio file" feature)
+### Entitlements
+Managed via Xcode build settings (no standalone `.entitlements` file); the codesign step expands them into the embedded entitlements.
+- `com.apple.security.app-sandbox` = true (`ENABLE_APP_SANDBOX = YES`)
+- `com.apple.security.device.audio-input` = true (`ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES`)
+- `com.apple.security.network.client` = true (`ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES`, for FluidAudio one-time model download)
+- `com.apple.security.files.user-selected.read-only` = true (`ENABLE_USER_SELECTED_FILES = readonly`, for any "import audio file" feature)
 
 ### Info.plist
 - `NSMicrophoneUsageDescription` — required, or mic permission request crashes.
@@ -503,7 +504,7 @@ Each phase ends at a testable milestone. Don't move on until the milestone passe
 | 10 — Crash Recovery & Polish | ⬜ | — |
 
 ### ✅ Phase 1 — Foundation
-Project scaffold (SwiftPM-based Xcode project), sandbox + entitlements, Sadi.entitlements file, build settings as above. App launches, requests mic permission, shows an empty window. **Milestone:** clean build, mic permission granted, empty UI.
+Project scaffold (SwiftPM-based Xcode project), sandbox + entitlements (via build settings; see §12), Info.plist with the required usage descriptions, build settings as above. App launches, requests mic permission, shows an empty window. **Milestone:** clean build, mic permission granted, empty UI.
 
 > **Done.** SadiKit local SwiftPM package at the repo root, app target reuses the existing `Sadi.xcodeproj` per user direction. Entitlements already matched §12 from v0; switched to a hand-authored `Info.plist` to add the new keys.
 
