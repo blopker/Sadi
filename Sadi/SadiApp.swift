@@ -2,7 +2,21 @@ import Foundation
 import SadiKit
 import SwiftUI
 
+/// Single binary, two faces. `Sadi cli …` runs the transcription pipeline
+/// headless (see `SadiCLI`); anything else launches the SwiftUI app. The CLI
+/// branch never touches AppKit, so no window or Dock icon appears.
 @main
+struct AppEntry {
+    static func main() async {
+        let args = CommandLine.arguments
+        if args.count > 1, args[1] == "cli" {
+            let code = await SadiCLI.run(arguments: Array(args.dropFirst(2)))
+            exit(code)
+        }
+        SadiApp.main()
+    }
+}
+
 struct SadiApp: App {
     @State private var modelHost: ModelHost
     @State private var voiceprints: VoiceprintBook
@@ -39,7 +53,7 @@ struct SadiApp: App {
         .windowResizability(.contentSize)
     }
 
-    private static func voiceprintBookURL() -> URL {
+    static func voiceprintBookURL() -> URL {
         let support = try? FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,

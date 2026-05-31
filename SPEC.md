@@ -557,7 +557,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 > - **Phase 6.1 fingerprint signal**: cosine-distance signal (b) against centroid voiceprints in EchoFilter. We now have the embedding pipeline from Phase 8; the data is available.
 
 **Crash recovery & data safety**:
-> - **"Finalize from audio"** recovery action for unfinalized sessions (§10.5): re-run the pipeline over existing segment fMP4s to produce `transcript.json`. Pure pipeline — the offline path is already proven in `scratch/pipetest`.
+> - **"Finalize from audio"** recovery action for unfinalized sessions (§10.5): re-run the pipeline over existing segment fMP4s to produce `transcript.json`. Pure pipeline — the offline path is already proven by `Sadi cli replay` (see `Sadi/CLI/`), which drives the live `StreamProcessor`/`TranscriptStore` from recorded files.
 > - **Pause / resume + multi-segment writers** (§10.2): the one structural piece — splits a session into multiple `mic-NNN.mp4` / `system-NNN.mp4` segment pairs and rewrites `session.json` on each transition. Needs a single pause button; the work is in `CaptureController` / writers / `session.json` schema.
 > - **Quit-while-recording confirmation dialog**: tiny; prevents data loss.
 

@@ -190,9 +190,8 @@ actor StreamProcessor {
             }
 
             // Per-token timing → split this VAD segment into one Utterance per
-            // speaker-coherent word run. Same approach pipetest uses; see
-            // scratch/pipetest/Sources/pipetest/main.swift for the offline
-            // mirror.
+            // speaker-coherent word run. `Sadi cli replay` drives this exact
+            // path from recorded files (see Sadi/CLI/FileReplayDriver.swift).
             let words = groupTokensIntoWords(timings)
             let runs = SpeakerSegmenter.splitIntoRuns(
                 tokens: words,

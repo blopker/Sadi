@@ -40,6 +40,20 @@ final class ModelHost {
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "models")
 
+    /// Whether every model folder `loadIfNeeded()` needs is already on disk.
+    /// The CLI uses this to fail fast instead of silently kicking off a
+    /// (potentially large) HuggingFace download in a headless run.
+    nonisolated static func modelsPresent() -> Bool {
+        let root = AsrModels.defaultCacheDirectory(for: .v2).deletingLastPathComponent()
+        let required = ["parakeet-tdt-0.6b-v2", "ls-eend", "silero-vad", "speaker-diarization"]
+        let fm = FileManager.default
+        return required.allSatisfy { name in
+            var isDir: ObjCBool = false
+            let path = root.appending(path: name, directoryHint: .isDirectory).path(percentEncoded: false)
+            return fm.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+        }
+    }
+
     func loadIfNeeded() async {
         switch state {
         case .ready, .loading: return
