@@ -24,17 +24,17 @@ actor StreamProcessor {
     private let startWallClock: Date
 
     private var streamState: VadStreamState
-    private var pending16k: [Float] = []        // accumulator for partial chunks
-    private var window: [Float] = []            // rolling window of 16 kHz samples
-    private var windowStartSample: Int64 = 0    // absolute index of window[0]
+    private var pending16k: [Float] = []  // accumulator for partial chunks
+    private var window: [Float] = []  // rolling window of 16 kHz samples
+    private var windowStartSample: Int64 = 0  // absolute index of window[0]
     private var pendingSpeechStart: Int64?
 
     // Cap the unspoken backlog so a silent recording doesn't grow unbounded.
     private let windowCapSeconds: Int = 30
     private var windowCapSamples: Int { windowCapSeconds * Int(Resampler.targetRate) }
 
-    private let minSpeechSamples = Int(Resampler.targetRate * 0.3)   // 300 ms
-    private let maxSpeechSamples = Int(Resampler.targetRate * 14)    // < model cap (15 s)
+    private let minSpeechSamples = Int(Resampler.targetRate * 0.3)  // 300 ms
+    private let maxSpeechSamples = Int(Resampler.targetRate * 14)  // < model cap (15 s)
 
     private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "stream")
 
@@ -77,7 +77,8 @@ actor StreamProcessor {
             )
             self.resamplerSourceRate = measuredRate
         } catch {
-            Self.log.error("Resampler retune failed: \(String(describing: error), privacy: .public)")
+            Self.log.error(
+                "Resampler retune failed: \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -155,7 +156,9 @@ actor StreamProcessor {
         let startInWindow = Int(absoluteStart - windowStartSample)
         let endInWindow = Int(absoluteEnd - windowStartSample)
         guard startInWindow >= 0, endInWindow <= window.count else {
-            Self.log.error("Segment outside window — dropped (start=\(startInWindow), end=\(endInWindow), windowCount=\(self.window.count))")
+            Self.log.error(
+                "Segment outside window — dropped (start=\(startInWindow), end=\(endInWindow), windowCount=\(self.window.count))"
+            )
             return
         }
         let segmentSamples = Array(window[startInWindow..<endInWindow])
@@ -170,7 +173,8 @@ actor StreamProcessor {
 
             // No per-token timing → single Utterance with dominant speaker.
             guard let timings = result.tokenTimings, !timings.isEmpty else {
-                let cluster = dominantCluster(startSec: segmentStartSec, endSec: Double(absoluteEnd) / Resampler.targetRate)
+                let cluster = dominantCluster(
+                    startSec: segmentStartSec, endSec: Double(absoluteEnd) / Resampler.targetRate)
                 let speaker = label(source: source, cluster: cluster)
                 await emitUtterance(
                     text: fullText,
@@ -204,7 +208,8 @@ actor StreamProcessor {
                 if runText.isEmpty { continue }
                 let runStartIdx = max(0, Int(run.startTime * Resampler.targetRate))
                 let runEndIdx = min(segmentSamples.count, Int(run.endTime * Resampler.targetRate))
-                let runAudio = runEndIdx > runStartIdx
+                let runAudio =
+                    runEndIdx > runStartIdx
                     ? Array(segmentSamples[runStartIdx..<runEndIdx])
                     : segmentSamples
 
@@ -275,11 +280,12 @@ actor StreamProcessor {
         for tt in timings {
             let startsWord = tt.token.hasPrefix(" ") || tt.token.hasPrefix("▁")
             if startsWord && !currentTexts.isEmpty {
-                words.append(TimedToken(
-                    text: currentTexts.joined(),
-                    startTime: currentStart,
-                    endTime: currentEnd
-                ))
+                words.append(
+                    TimedToken(
+                        text: currentTexts.joined(),
+                        startTime: currentStart,
+                        endTime: currentEnd
+                    ))
                 currentTexts = []
             }
             if currentTexts.isEmpty {
@@ -289,11 +295,12 @@ actor StreamProcessor {
             currentEnd = tt.endTime
         }
         if !currentTexts.isEmpty {
-            words.append(TimedToken(
-                text: currentTexts.joined(),
-                startTime: currentStart,
-                endTime: currentEnd
-            ))
+            words.append(
+                TimedToken(
+                    text: currentTexts.joined(),
+                    startTime: currentStart,
+                    endTime: currentEnd
+                ))
         }
         return words
     }
