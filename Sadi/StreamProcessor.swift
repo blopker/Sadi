@@ -34,7 +34,13 @@ actor StreamProcessor {
     private var windowCapSamples: Int { windowCapSeconds * Int(Resampler.targetRate) }
 
     private let minSpeechSamples = Int(Resampler.targetRate * 0.3)  // 300 ms
-    private let maxSpeechSamples = Int(Resampler.targetRate * 14)  // < model cap (15 s)
+    // Backstop force-split for speech that never hits a VAD pause. 60 s rather
+    // than the old 14 s: AsrManager.transcribe internally chunks audio > ~15 s
+    // via ChunkProcessor (overlapping windows + token dedup), so long segments
+    // transcribe fine — and more cleanly than several cold 14 s force-splits,
+    // which each restart the decoder with no overlap. Trades worst-case latency
+    // on a 60 s-unbroken monologue for far fewer mid-word seams.
+    private let maxSpeechSamples = Int(Resampler.targetRate * 60)
 
     private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "stream")
 
