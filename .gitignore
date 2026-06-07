@@ -9,6 +9,5 @@ DerivedData/
 *.xcuserstate
 
 # Scratch
-scratch/verify/
-scratch/output/
+scratch/
 .antigravitycli/
