@@ -31,6 +31,10 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     private static let nanosecondTimescale: CMTimeScale = 1_000_000_000
     private var framesWritten: Int64 = 0
     private var didStart = false
+    /// Set once an append fails. `AVAssetWriter` latches to `.failed` on the
+    /// first encode error, so every later append would fail too; short-circuit
+    /// to surface the error exactly once instead of spamming it per buffer.
+    private var didFail = false
 
     public init(url: URL, sampleRate: Double) throws {
         self.sampleRate = sampleRate
@@ -64,12 +68,23 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         }
         self.format = format
 
-        // Output AAC encoder settings. 64 kbps mono per SPEC §10.6.
+        // Output AAC encoder settings. 64 kbps mono per SPEC §10.6 — but only
+        // at "normal" rates. AAC can't encode arbitrary input rates, and 64
+        // kbps is an *invalid* bitrate at low sample rates: a Bluetooth /
+        // AirPods mic in HFP mode reports 16 kHz (or 8 kHz), where the encoder
+        // rejects 64 kbps with -12651 ("encoding parameters not supported") on
+        // the first append and then latches `.failed` for the whole segment.
+        // So snap the encode rate to a supported AAC rate (AVAssetWriter
+        // resamples the source PCM for us — the PCM `format` below stays at the
+        // true `sampleRate`, and PTS are wall-clock so timing is unaffected) and
+        // scale the bitrate into the valid window for that rate. Mapping verified
+        // across 8 k–48 k.
+        let encodeRate = SegmentArchiveWriter.snappedAACRate(for: sampleRate)
         let outputSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVNumberOfChannelsKey: 1,
-            AVSampleRateKey: sampleRate,
-            AVEncoderBitRateKey: 64_000,
+            AVSampleRateKey: encodeRate,
+            AVEncoderBitRateKey: SegmentArchiveWriter.aacBitRate(forOutputRate: encodeRate),
         ]
 
         let input = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
@@ -92,6 +107,7 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     /// the consumer task; blocks briefly during encode (Apple HW AAC is fast).
     public func append(_ samples: UnsafeBufferPointer<Float>) throws {
         guard samples.count > 0, let base = samples.baseAddress else { return }
+        if didFail { return }
 
         if !didStart {
             guard writer.startWriting() else {
@@ -156,6 +172,7 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         }
 
         if !input.append(sample) {
+            didFail = true
             throw Error.appendFailed(writer.error as NSError?)
         }
         framesWritten &+= Int64(nFrames)
@@ -170,5 +187,32 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         }
         input.markAsFinished()
         await writer.finishWriting()
+    }
+
+    // MARK: - AAC parameter selection
+
+    /// Sample rates the AAC encoder accepts. A device may report something off
+    /// this list (exotic hardware, or a rate the driver rounds oddly); feeding
+    /// such a rate to `AVAssetWriterInput` throws an *uncatchable* NSException,
+    /// so we snap to the nearest supported rate and let AVAssetWriter resample.
+    private static let supportedAACRates: [Double] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000,
+    ]
+
+    static func snappedAACRate(for rate: Double) -> Double {
+        supportedAACRates.min(by: { abs($0 - rate) < abs($1 - rate) }) ?? 48_000
+    }
+
+    /// Largest "safe" mono AAC bitrate for a given encode rate. The encoder
+    /// rejects bitrates above a rate-dependent ceiling (e.g. 64 kbps is invalid
+    /// at ≤16 kHz). These bands sit comfortably inside the valid window at every
+    /// supported rate while keeping the original 64 kbps at normal rates.
+    static func aacBitRate(forOutputRate rate: Double) -> Int {
+        switch rate {
+        case ..<12_001: return 16_000  // 8–12 kHz (HFP narrowband)
+        case ..<16_001: return 32_000  // 16 kHz (HFP wideband / AirPods mic)
+        case ..<24_001: return 48_000  // 22.05–24 kHz
+        default: return 64_000         // 32 kHz and up
+        }
     }
 }
