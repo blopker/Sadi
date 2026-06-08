@@ -204,6 +204,32 @@ final class CaptureController {
                     }
                 }
             }
+
+            // Drain the tail. `mic.stop()` / `system.stop()` removed the tap
+            // before this task was cancelled, so the producer is quiesced and
+            // `availableToRead` is a stable, shrinking count. The main loop
+            // only pulls full 1024-sample chunks, so the final sub-1024
+            // fragment would otherwise never reach the MP4 or the transcript.
+            while ring.availableToRead > 0 {
+                let n = min(ring.availableToRead, scratch.count)
+                let pulled = scratch.withUnsafeMutableBufferPointer { buf in
+                    ring.pull(count: n, into: buf)
+                }
+                // The producer is stopped, so `availableToRead` only shrinks
+                // and a pull of `n <= availableToRead` can't underrun; the
+                // guard is just belt-and-suspenders against a stuck pull.
+                guard pulled else { break }
+                let tail = Array(scratch[0 ..< n])
+                tail.withUnsafeBufferPointer { buf in
+                    do {
+                        try writer.append(buf)
+                    } catch {
+                        Self.log.error("Archive tail append: \(String(describing: error), privacy: .public)")
+                    }
+                }
+                await processor.feed(tail)
+            }
+
             await writer.finalize()
         }
     }

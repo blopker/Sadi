@@ -66,6 +66,16 @@ public final class SPSCRingBuffer: @unchecked Sendable {
         return true
     }
 
+    /// Number of samples currently available to pull. Consumer-side view:
+    /// safe to call only from the same thread that calls `pull`. The producer
+    /// can race the write index upward concurrently, so treat this as a
+    /// lower bound (it never over-reports unread data).
+    public var availableToRead: Int {
+        let currentWrite = writeIndex.load(ordering: .acquiring)
+        let currentRead = readIndex.load(ordering: .relaxed)
+        return currentWrite &- currentRead
+    }
+
     /// Called strictly by the GCD/Task processing thread (Wait-free)
     public func pull(count: Int, into destination: UnsafeMutableBufferPointer<Float>) -> Bool {
         precondition(destination.count >= count, "destination buffer is smaller than requested count")

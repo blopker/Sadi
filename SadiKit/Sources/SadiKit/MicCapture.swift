@@ -1,6 +1,8 @@
+import AudioToolbox
 import AVFoundation
 import CoreAudio
 import Foundation
+import OSLog
 import Synchronization
 
 /// Microphone capture per SPEC §5.1.
@@ -10,6 +12,14 @@ import Synchronization
 /// arrays bleed/cancel if averaged) and push into the SPSC ring. Everything
 /// else — resampling, file writing, VAD, ASR — happens on a normal-priority
 /// consumer task that pulls from the ring.
+///
+/// The engine input node binds to the *system default* input device. macOS
+/// does NOT automatically re-point it when the default changes (plug in
+/// headphones / a USB interface and the old device goes silent), so we listen
+/// for `kAudioHardwarePropertyDefaultInputDevice` and re-bind + restart on the
+/// fly. The tap stays pinned to the original `sampleRate` and AVAudioEngine
+/// resamples the new device for us, so every downstream consumer keeps its
+/// clock contract even when the new device runs at a different native rate.
 ///
 /// `setVoiceProcessingEnabled` is never touched (see SPEC Appendix A).
 public final class MicCapture: @unchecked Sendable {
@@ -25,11 +35,26 @@ public final class MicCapture: @unchecked Sendable {
     /// Hardware nominal sample rate of the resolved input device, in Hz.
     /// Read once at init from `kAudioDevicePropertyNominalSampleRate` because
     /// `inputNode.outputFormat` can lag the hardware after device switches.
+    /// Held fixed for the lifetime of the capture: if the default device later
+    /// changes, the engine resamples the new device down/up to this rate so the
+    /// archive writer and resampler downstream never see a rate change.
     public let sampleRate: Double
 
     private let engine = AVAudioEngine()
     private let firstHostTimeAtomic = Atomic<UInt64>(0)
     private var isRunning = false
+
+    /// Serializes device re-binding against itself. Also the queue the
+    /// CoreAudio property listener fires on.
+    private let reconfigQueue = DispatchQueue(label: "io.kbl.sadi.miccapture.reconfig")
+    /// Live CoreAudio listener block (kept so we can remove it on stop).
+    private var defaultInputListener: AudioObjectPropertyListenerBlock?
+    /// Observer token for `.AVAudioEngineConfigurationChange`.
+    private var configObserver: NSObjectProtocol?
+    /// The input device the engine is currently bound to.
+    private var boundDeviceID: AudioDeviceID = 0
+
+    nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "mic")
 
     /// `mach_absolute_time` of the very first sample pushed into the ring;
     /// nil until the first tap callback has run.
@@ -55,6 +80,38 @@ public final class MicCapture: @unchecked Sendable {
         guard !isRunning else { return }
         firstHostTimeAtomic.store(0, ordering: .releasing)
 
+        try bindEngineInputToDefaultDevice()
+        try installTapAndStartEngine()
+        isRunning = true
+
+        registerDeviceChangeListeners()
+    }
+
+    public func stop() {
+        guard isRunning else { return }
+        // Tear the listeners down first so a late device-change callback can't
+        // resurrect the engine after we've stopped.
+        removeDeviceChangeListeners()
+        isRunning = false
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+    }
+
+    deinit {
+        removeDeviceChangeListeners()
+        // Best-effort teardown if the user forgot `stop()`. Once the tap
+        // closure captures self weakly, this path is actually reachable.
+        if isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+    }
+
+    // MARK: - Engine wiring
+
+    /// Install the bus-0 tap (pinned to `sampleRate`) and start the engine.
+    /// Shared by `start()` and the device-change rebuild path.
+    private func installTapAndStartEngine() throws {
         let input = engine.inputNode
         let nativeFormat = input.outputFormat(forBus: 0)
 
@@ -66,7 +123,8 @@ public final class MicCapture: @unchecked Sendable {
         // (resampler, AAC writer, host-time math) would be mis-clocked —
         // pitch-shifted output and accumulating drift. AVAudioEngine
         // inserts an internal sample-rate conversion when the tap format
-        // differs from the bus format, so this stays correct even mid-lag.
+        // differs from the bus format, so this stays correct even when a
+        // freshly-plugged device runs at a different native rate.
         // Channels stay native so the channel-0 extract still has a
         // multi-channel buffer to work with.
         guard let tapFormat = AVAudioFormat(
@@ -101,22 +159,91 @@ public final class MicCapture: @unchecked Sendable {
 
         engine.prepare()
         try engine.start()
-        isRunning = true
     }
 
-    public func stop() {
+    /// Point the engine's input HAL unit at the current system default input
+    /// device. Must be called while the engine is stopped. AVAudioEngine on
+    /// macOS otherwise sticks to whichever device was default at first start,
+    /// so without this an unplug/plug leaves the mic silent.
+    private func bindEngineInputToDefaultDevice() throws {
+        let device = try MicCapture.defaultInputDevice()
+        boundDeviceID = device
+        guard let unit = engine.inputNode.audioUnit else { return }
+        var deviceID = device
+        let status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if status != noErr {
+            Self.log.error("Set input CurrentDevice failed: \(status, privacy: .public)")
+        }
+    }
+
+    // MARK: - Device-change handling
+
+    private func registerDeviceChangeListeners() {
+        var addr = MicCapture.defaultInputAddress
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // Already on `reconfigQueue` (the listener's dispatch queue).
+            self?.reconfigure(force: false)
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block
+        )
+        if status == noErr {
+            defaultInputListener = block
+        } else {
+            Self.log.error("Add default-input listener failed: \(status, privacy: .public)")
+        }
+
+        // The engine also posts this when its current device's format changes
+        // or the device disappears; rebuild unconditionally in that case.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.reconfigQueue.async { self.reconfigure(force: true) }
+        }
+    }
+
+    private func removeDeviceChangeListeners() {
+        if let block = defaultInputListener {
+            var addr = MicCapture.defaultInputAddress
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block
+            )
+            defaultInputListener = nil
+        }
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configObserver = nil
+        }
+    }
+
+    /// Re-point the engine at the current default input device and restart.
+    /// Always runs on `reconfigQueue`. `force` rebuilds even when the device
+    /// id is unchanged (used for engine config-change events where only the
+    /// format moved).
+    private func reconfigure(force: Bool) {
         guard isRunning else { return }
+        let newDevice = (try? MicCapture.defaultInputDevice()) ?? 0
+        guard newDevice != 0 else { return }
+        if !force, newDevice == boundDeviceID { return }
+
+        Self.log.notice("Input device changed; re-binding mic capture to \(newDevice, privacy: .public)")
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        isRunning = false
-    }
-
-    deinit {
-        // Best-effort teardown if the user forgot `stop()`. Once the tap
-        // closure captures self weakly, this path is actually reachable.
-        if isRunning {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+        do {
+            try bindEngineInputToDefaultDevice()
+            try installTapAndStartEngine()
+        } catch {
+            Self.log.error("Re-bind after device change failed: \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -129,25 +256,35 @@ public final class MicCapture: @unchecked Sendable {
         return v
     }
 
+    private static var defaultInputAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    /// Resolve the system default input device id.
+    private static func defaultInputDevice() throws -> AudioDeviceID {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = defaultInputAddress
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID
+        )
+        guard status == noErr, deviceID != 0 else { throw Error.noInputDevice }
+        return deviceID
+    }
+
     /// Resolve the system default input device and read its
     /// `kAudioDevicePropertyNominalSampleRate`. SPEC §5.1 calls this out as
     /// the authoritative rate; `inputNode.outputFormat` can stale-read across
     /// device switches.
     private static func hardwareInputSampleRate() throws -> Double {
-        var deviceID = AudioDeviceID(0)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let s1 = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID
-        )
-        guard s1 == noErr, deviceID != 0 else { throw Error.noInputDevice }
+        let deviceID = try defaultInputDevice()
 
         var rate: Double = 0
-        size = UInt32(MemoryLayout<Double>.size)
+        var size = UInt32(MemoryLayout<Double>.size)
         var rateAddr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
