@@ -29,6 +29,7 @@ final class CaptureController {
     private var system: SystemAudioCapture?
     private var micConsumer: Task<Void, Never>?
     private var systemConsumer: Task<Void, Never>?
+    private var systemStartTask: Task<Void, Never>?
     private var sessionDirectory: URL?
     private var sessionStartWallClock: Date?
     // Filenames of the segment archives actually opened this session, recorded
@@ -107,7 +108,48 @@ final class CaptureController {
             Self.log.error("Mic start failed: \(String(describing: error), privacy: .public)")
         }
 
-        // System audio pipeline.
+        // System audio pipeline — deferred until the mic has actually started
+        // producing audio. Opening the mic input can kick off a Bluetooth
+        // A2DP→HFP profile switch that churns CoreAudio for ~1 s; creating the
+        // system process tap during that window corrupts it (-10877 storms, a
+        // collapsed effective rate). The mic's first delivered frame signals
+        // the input device (and any profile switch) has settled.
+        systemStatus = "waiting for mic"
+        systemStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for _ in 0..<40 {  // up to ~2 s
+                if Task.isCancelled { return }
+                if self.mic?.firstHostTime != nil { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if Task.isCancelled { return }
+            guard self.isRunning,
+                  let vad = self.modelHost.vad,
+                  let asrModels = self.modelHost.asrModels,
+                  let diarizerModel = self.modelHost.diarizerModel,
+                  let embeddingDiarizer = self.modelHost.embeddingDiarizer
+            else { return }
+            self.startSystemPipeline(
+                session: session,
+                startWallClock: startWallClock,
+                vad: vad,
+                asrModels: asrModels,
+                diarizerModel: diarizerModel,
+                embeddingDiarizer: embeddingDiarizer
+            )
+        }
+    }
+
+    /// Build and start the system-audio pipeline. Split out of `start()` so it
+    /// can run after the mic has settled (see the deferred task in `start`).
+    private func startSystemPipeline(
+        session: SessionPaths,
+        startWallClock: Date,
+        vad: VadManager,
+        asrModels: AsrModels,
+        diarizerModel: LSEENDModel,
+        embeddingDiarizer: DiarizerManager
+    ) {
         do {
             let s = try SystemAudioCapture()
             let writer = try SegmentArchiveWriter(
@@ -147,8 +189,24 @@ final class CaptureController {
         guard isRunning else { return }
         // Stamp the end the moment the user stopped, before the finalize awaits.
         let endedAt = Date()
-        mic?.stop()
-        system?.stop()
+        // Cancel the deferred system start and wait it out, so it can't bring a
+        // system pipeline up after we've begun tearing down. `isRunning` stays
+        // true until the end here, which also blocks a re-`start()` race.
+        systemStartTask?.cancel()
+        await systemStartTask?.value
+        systemStartTask = nil
+        // Tear the capture devices down OFF the main thread. `MicCapture.stop()`
+        // / `SystemAudioCapture.stop()` make blocking HAL calls (AudioOutputUnitStop,
+        // AudioDeviceStop, dispose) that can wedge for seconds when a Bluetooth
+        // device is mid-transition — running them on the main actor beachballs the
+        // UI. `await`ing a detached task suspends the main actor without blocking
+        // the main thread. Both capture types are Sendable.
+        let micToStop = self.mic
+        let systemToStop = self.system
+        await Task.detached(priority: .userInitiated) {
+            micToStop?.stop()
+            systemToStop?.stop()
+        }.value
         micConsumer?.cancel()
         systemConsumer?.cancel()
         await micConsumer?.value
@@ -259,7 +317,9 @@ final class CaptureController {
                     )
                     if elapsed >= rateCheckIntervalSec {
                         lastRateCheckHostTime = now
-                        if let measured = rateSource.effectiveSampleRate(asOf: now) {
+                        // Measured against realtime-stamped host times inside the
+                        // capture, not `now` — avoids consumer-thread jitter.
+                        if let measured = rateSource.effectiveSampleRate() {
                             await processor.retuneSourceRate(measured)
                         }
                     }
