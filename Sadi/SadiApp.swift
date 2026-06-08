@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import OSLog
 import SadiKit
 import SwiftUI
 
@@ -17,7 +19,31 @@ struct AppEntry {
     }
 }
 
+/// Intercepts app termination (⌘Q, menu Quit, logout) so a recording in
+/// progress is finalized like a normal Stop — MP4s flushed, then transcript
+/// written — before the process exits. A force-quit or crash bypasses this;
+/// the fragmented MP4s remain re-derivable in that case.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var controller: CaptureController?
+
+    nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "lifecycle")
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let controller, controller.isRunning else { return .terminateNow }
+        // Defer termination, run the same stop path the UI button uses, then
+        // let AppKit finish quitting once everything is on disk.
+        Task {
+            Self.log.notice("Quit while recording — finalizing session before exit")
+            await controller.stop()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 struct SadiApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var modelHost: ModelHost
     @State private var voiceprints: VoiceprintBook
     @State private var transcript: TranscriptStore
@@ -47,6 +73,7 @@ struct SadiApp: App {
             )
             .frame(minWidth: 760, minHeight: 480)
             .task {
+                appDelegate.controller = controller
                 await modelHost.loadIfNeeded()
             }
         }

@@ -29,6 +29,13 @@ final class CaptureController {
     private var system: SystemAudioCapture?
     private var micConsumer: Task<Void, Never>?
     private var systemConsumer: Task<Void, Never>?
+    private var sessionDirectory: URL?
+    private var sessionStartWallClock: Date?
+    // Filenames of the segment archives actually opened this session, recorded
+    // only on the success path so `session.json` reflects what's on disk
+    // (nil if that pipeline failed to start).
+    private var micSegmentFile: String?
+    private var systemSegmentFile: String?
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "capture")
 
@@ -58,8 +65,10 @@ final class CaptureController {
             return
         }
         sessionID = session.id
+        sessionDirectory = session.directory
         sessionDirectoryPath = session.directory.path(percentEncoded: false)
         let startWallClock = Date()
+        sessionStartWallClock = startWallClock
         transcript.reset()
         isRunning = true
 
@@ -82,6 +91,7 @@ final class CaptureController {
             )
             try m.start()
             mic = m
+            micSegmentFile = session.micURL(segment: 1).lastPathComponent
             micStatus = "running @ \(Int(m.sampleRate)) Hz"
             micConsumer = consume(
                 ring: m.ring,
@@ -116,6 +126,7 @@ final class CaptureController {
             )
             try s.start()
             system = s
+            systemSegmentFile = session.systemURL(segment: 1).lastPathComponent
             systemStatus = "running @ \(Int(s.sampleRate)) Hz"
             systemConsumer = consume(
                 ring: s.ring,
@@ -134,21 +145,71 @@ final class CaptureController {
 
     func stop() async {
         guard isRunning else { return }
+        // Stamp the end the moment the user stopped, before the finalize awaits.
+        let endedAt = Date()
         mic?.stop()
         system?.stop()
         micConsumer?.cancel()
         systemConsumer?.cancel()
         await micConsumer?.value
         await systemConsumer?.value
+        // MP4s are finalized now (the consumers drain + `writer.finalize()`
+        // before returning). Persist on-disk artifacts in SPEC §10.6 order:
+        // audio (done) → transcript.json → session.json. A clean Stop and a
+        // graceful quit (which routes through this same path) both leave a
+        // fully self-describing session directory.
+        if let dir = sessionDirectory {
+            do {
+                try await transcript.writeTranscript(to: dir)
+            } catch {
+                Self.log.error("Transcript persist failed: \(String(describing: error), privacy: .public)")
+            }
+            writeSessionMetadata(to: dir, endedAt: endedAt)
+        }
         mic = nil
         system = nil
         micConsumer = nil
         systemConsumer = nil
+        sessionDirectory = nil
+        sessionStartWallClock = nil
+        micSegmentFile = nil
+        systemSegmentFile = nil
         micLevel = 0
         systemLevel = 0
         micStatus = "idle"
         systemStatus = "idle"
         isRunning = false
+    }
+
+    /// Write `session.json` describing the finalized session. Single-segment
+    /// for now (pause/resume is a later phase). `speakerClusters` is left empty
+    /// — the diarizer timeline lives per-stream and exporting it is future
+    /// Phase 10 work; the field is still written so the schema is stable.
+    private func writeSessionMetadata(to directory: URL, endedAt: Date) {
+        guard let start = sessionStartWallClock else { return }
+        // Don't write metadata for a session where neither pipeline ever
+        // produced a file — there's nothing to describe.
+        guard micSegmentFile != nil || systemSegmentFile != nil else { return }
+        let segment = Segment(
+            index: 1,
+            startedAt: start,
+            endedAt: endedAt,
+            micFilename: micSegmentFile ?? "mic-001.mp4",
+            systemFilename: systemSegmentFile
+        )
+        let session = Session(
+            id: sessionID,
+            title: "",
+            startedAt: start,
+            endedAt: endedAt,
+            segments: [segment],
+            speakerClusters: []
+        )
+        do {
+            try session.write(to: directory)
+        } catch {
+            Self.log.error("Session metadata persist failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     private nonisolated func consume(

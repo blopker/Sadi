@@ -117,6 +117,37 @@ final class TranscriptStore {
     func rerunVoiceprintMatching() {
         utterances = utterances.map(resolveVoiceprint)
     }
+
+    /// Persist the current transcript to `transcript.json` in the session
+    /// directory. Called from `CaptureController.stop()` after the MP4s are
+    /// finalized, so a clean Stop (or a graceful app quit, which routes through
+    /// the same stop path) leaves both the audio and the transcript on disk.
+    /// The write is atomic; a partial file can never replace a good one.
+    ///
+    /// Not a crash-recovery mechanism — a force-quit or crash never reaches
+    /// here. The session's fragmented MP4s remain the source of truth and the
+    /// transcript can be re-derived from them (transcription is cheap).
+    func writeTranscript(to directory: URL) throws {
+        let doc = TranscriptDocument(
+            schemaVersion: 1,
+            sessionID: directory.lastPathComponent,
+            utterances: utterances
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(doc)
+        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+/// On-disk shape of `transcript.json`. `schemaVersion` lets a later reader
+/// migrate older files; `Utterance` is already `Codable` (SadiKit).
+struct TranscriptDocument: Codable {
+    let schemaVersion: Int
+    let sessionID: String
+    let utterances: [Utterance]
 }
 
 struct DroppedUtterance: Identifiable, Hashable, Sendable {
