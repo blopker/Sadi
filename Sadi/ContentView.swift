@@ -43,7 +43,6 @@ struct ContentView: View {
 
     private var header: some View {
         HStack {
-            Text("Sadi").font(.title2)
             Spacer()
             Toggle("Show dropped", isOn: $showDropped)
                 .toggleStyle(.switch)

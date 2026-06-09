@@ -65,13 +65,13 @@ struct SadiApp: App {
 
     var body: some Scene {
         WindowGroup("Sadi", id: "main") {
-            ContentView(
+            RootView(
                 modelHost: modelHost,
                 transcript: transcript,
                 voiceprints: voiceprints,
                 controller: controller
             )
-            .frame(minWidth: 760, minHeight: 480)
+            .frame(minWidth: 900, minHeight: 520)
             .task {
                 appDelegate.controller = controller
                 await modelHost.loadIfNeeded()
