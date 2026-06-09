@@ -131,7 +131,6 @@ final class CaptureController {
             else { return }
             self.startSystemPipeline(
                 session: session,
-                startWallClock: startWallClock,
                 vad: vad,
                 asrModels: asrModels,
                 diarizerModel: diarizerModel,
@@ -144,12 +143,18 @@ final class CaptureController {
     /// can run after the mic has settled (see the deferred task in `start`).
     private func startSystemPipeline(
         session: SessionPaths,
-        startWallClock: Date,
         vad: VadManager,
         asrModels: AsrModels,
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager
     ) {
+        // Stamp the system stream's sample-0 wall clock *now* — not at session
+        // start. The system tap is brought up here, ~1.5–2 s after the mic (we
+        // waited for the mic/Bluetooth path to settle), so anchoring to session
+        // start would slot every system utterance ~1.5 s too early relative to
+        // the mic. `Date()` here is within a few tens of ms of the tap's first
+        // frame, which is well below noticeable.
+        let startWallClock = Date()
         do {
             let s = try SystemAudioCapture()
             let writer = try SegmentArchiveWriter(

@@ -21,6 +21,12 @@ actor StreamProcessor {
     private let diarizer: LSEENDDiarizer
     private let embeddingDiarizer: DiarizerManager
     private let store: TranscriptStore
+    /// Wall-clock instant this stream's sample 0 was captured. Each stream gets
+    /// its own: the mic uses session start, but the system tap is brought up
+    /// ~1.5–2 s later (we wait for the mic/Bluetooth path to settle first), so
+    /// sharing one session-start `Date` would slot every system utterance
+    /// ~1.5 s too early. `CaptureController` stamps the system's value when the
+    /// system pipeline actually starts.
     private let startWallClock: Date
 
     private var streamState: VadStreamState

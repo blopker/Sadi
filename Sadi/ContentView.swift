@@ -324,7 +324,9 @@ private struct UtteranceRow: View {
                 Text(utterance.text)
                     .font(.body)
                     .textSelection(.enabled)
-                Text(utterance.startedAt, style: .time)
+                // Include seconds — `style: .time` renders only H:MM in en_US,
+                // which hides the sub-minute ordering between mic and system.
+                Text(utterance.startedAt.formatted(date: .omitted, time: .standard))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
