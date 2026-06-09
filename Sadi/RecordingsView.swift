@@ -74,10 +74,14 @@ struct RecordingsView: View {
     @Binding var path: [RecordingsRoute]
 
     @State private var store = RecordingsStore()
+    // Drives the row highlight. Without an explicit binding, SwiftUI leaves a
+    // pushed NavigationLink's row highlighted after popping back, and the stale
+    // highlight swallows the next tap — so we clear it whenever the stack empties.
+    @State private var selection: RecordingsRoute?
 
     var body: some View {
         NavigationStack(path: $path) {
-            List {
+            List(selection: $selection) {
                 if controller.isRunning {
                     Section {
                         NavigationLink(value: RecordingsRoute.live) {
@@ -122,6 +126,11 @@ struct RecordingsView: View {
             }
         }
         .task { store.reload() }
+        .onChange(of: path) { _, newPath in
+            // Back to the root list — drop the lingering row highlight so the
+            // same row can be tapped again immediately.
+            if newPath.isEmpty { selection = nil }
+        }
         .onChange(of: controller.isRunning) { wasRunning, isRunning in
             // A recording just finished — its session.json is on disk now.
             if wasRunning && !isRunning {
