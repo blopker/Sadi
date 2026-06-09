@@ -94,7 +94,7 @@ struct RecordingsView: View {
                     }
                 }
 
-                Section("Recordings") {
+                Section {
                     if store.items.isEmpty {
                         Text("No recordings yet. Press Record to start.")
                             .foregroundStyle(.secondary)
