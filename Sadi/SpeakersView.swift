@@ -272,3 +272,22 @@ private struct Stat: View {
         }
     }
 }
+
+// MARK: - Previews
+
+/// Renders the detail panel from a plain `SpeakerSummary` — no data layer, no
+/// disk — so the canvas updates live as you edit. (Recordings are empty here to
+/// avoid faking `RecordingItem`/`Session`.)
+#Preview("Speaker detail") {
+    SpeakerDetailView(
+        speaker: SpeakerSummary(
+            id: UUID(),
+            name: "Alice Johnson",
+            sampleCount: 4,
+            enrolledAt: .now,
+            recordings: []
+        ),
+        onOpenRecording: { _ in }
+    )
+    .frame(width: 520, height: 400)
+}
