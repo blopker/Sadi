@@ -24,13 +24,12 @@ struct RootView: View {
         } detail: {
             switch selection {
             case .recordings:
-                ContentView(
+                RecordingsView(
                     modelHost: modelHost,
                     transcript: transcript,
                     voiceprints: voiceprints,
                     controller: controller
                 )
-                .navigationTitle("Recordings")
             case .speakers:
                 SpeakersView(voiceprints: voiceprints)
             case .settings:
