@@ -62,7 +62,15 @@ public final class MicCapture: @unchecked Sendable {
     private let hostTicksPerSample: Double
     /// Pre-allocated zeros for realtime-safe gap fill (no allocation in callback).
     private let silence = [Float](repeating: 0, count: 4096)
-    private var isRunning = false
+    /// Source frames the realtime callback failed to push because the ring was
+    /// full (audio + gap-fill silence). Monotonic per session. The consumer
+    /// polls this to keep its sample-count↔wall-clock invariant (the failed
+    /// frames are accounted as a timeline gap) and to trip the stall failsafe.
+    private let droppedFramesAtomic = Atomic<UInt64>(0)
+    /// Atomic because it crosses threads with no shared lock: `start()`/`stop()`
+    /// run on the caller's (typically detached) thread while the device-follow
+    /// listener reads it on `reconfigQueue`.
+    private let isRunningAtomic = Atomic<Bool>(false)
 
     /// Serializes device-follow against itself; also the queue the CoreAudio
     /// default-input listener fires on.
@@ -84,6 +92,11 @@ public final class MicCapture: @unchecked Sendable {
         return raw == 0 ? nil : raw
     }
 
+    /// Cumulative count of source frames lost to ring overflow since `start()`.
+    public var droppedFrames: UInt64 {
+        droppedFramesAtomic.load(ordering: .relaxed)
+    }
+
     public init() throws {
         let device = MicCapture.preferredInputDevice()
         guard device != 0 else { throw Error.noInputDevice }
@@ -96,36 +109,39 @@ public final class MicCapture: @unchecked Sendable {
         mach_timebase_info(&tb)
         self.hostTicksPerSample = (1_000_000_000.0 / hw) * (Double(tb.denom) / Double(tb.numer))
 
-        // ~5 s of source-rate audio (~1 MB). See SPEC §5.0 — long ASR + embedding
-        // stalls on the consumer would otherwise overflow a 1-second ring.
-        let cap = MicCapture.nextPowerOfTwo(Int(hw.rounded(.up)) * 5)
+        // ~10 s of source-rate audio (~2 MB). The consumer side only does disk
+        // appends (transcription is decoupled behind its own buffer), so this
+        // is pure headroom for disk-latency spikes; overflowing it trips the
+        // stall failsafe (see `droppedFrames`) rather than silently desyncing.
+        let cap = MicCapture.nextPowerOfTwo(Int(hw.rounded(.up)) * 10)
         self.ring = SPSCRingBuffer(capacity: cap)
     }
 
     // MARK: - Lifecycle
 
     public func start() throws {
-        guard !isRunning else { return }
+        guard !isRunningAtomic.load(ordering: .acquiring) else { return }
         firstHostTimeAtomic.store(0, ordering: .releasing)
         nextExpectedHostTimeAtomic.store(0, ordering: .releasing)
+        droppedFramesAtomic.store(0, ordering: .releasing)
 
         let unit = try makeInputUnit()
         self.unit = unit
 
         try bringUp(unit, device: MicCapture.preferredInputDevice())
 
-        isRunning = true
+        isRunningAtomic.store(true, ordering: .releasing)
         registerDeviceChangeListener()
     }
 
     public func stop() {
-        guard isRunning else { return }
-        // Flag first so an in-flight/scheduled reconcile bails, drop the listener
-        // so no new ones are scheduled, then tear down ON the reconfig queue so
-        // we never operate the unit from two threads (and never race a switch
+        // Flag first (exchange makes a concurrent double-stop single-winner)
+        // so an in-flight/scheduled reconcile bails, drop the listener so no
+        // new ones are scheduled, then tear down ON the reconfig queue so we
+        // never operate the unit from two threads (and never race a switch
         // that's mid-`AudioOutputUnitStart`). The sync waits at most one
         // single-shot switch (~1 s on a balky Bluetooth device), not a beachball.
-        isRunning = false
+        guard isRunningAtomic.exchange(false, ordering: .acquiringAndReleasing) else { return }
         removeDeviceChangeListener()
         reconfigQueue.sync { teardownUnit() }
     }
@@ -138,7 +154,7 @@ public final class MicCapture: @unchecked Sendable {
         // callback exits and guarantees no more), closing that window. This
         // deinit teardown is only a best-effort backstop for misuse.
         removeDeviceChangeListener()
-        if isRunning { teardownUnit() }
+        if isRunningAtomic.load(ordering: .acquiring) { teardownUnit() }
     }
 
     private func teardownUnit() {
@@ -279,7 +295,13 @@ public final class MicCapture: @unchecked Sendable {
                         while gap > 0 {
                             let c = min(gap, sil.count)
                             guard ring.push(data: UnsafeBufferPointer(start: sil.baseAddress, count: c))
-                            else { break }  // ring full — best-effort, don't spin
+                            else {
+                                // Ring full — best-effort, don't spin. Account
+                                // the unfilled remainder so the consumer can
+                                // keep the timeline and trip the failsafe.
+                                droppedFramesAtomic.add(UInt64(gap), ordering: .relaxed)
+                                break
+                            }
                             gap -= c
                         }
                     }
@@ -287,7 +309,9 @@ public final class MicCapture: @unchecked Sendable {
             }
         }
 
-        _ = ring.push(data: UnsafeBufferPointer(start: ch0, count: n))
+        if !ring.push(data: UnsafeBufferPointer(start: ch0, count: n)) {
+            droppedFramesAtomic.add(UInt64(n), ordering: .relaxed)
+        }
 
         let bufferTicks = UInt64(Double(n) * hostTicksPerSample)
         nextExpectedHostTimeAtomic.store(hostTime &+ bufferTicks, ordering: .releasing)
@@ -347,11 +371,14 @@ public final class MicCapture: @unchecked Sendable {
     }
 
     private func scheduleReconcile() {
-        guard isRunning else { return }
+        guard isRunningAtomic.load(ordering: .acquiring) else { return }
         reconcileGeneration &+= 1
         let generation = reconcileGeneration
         reconfigQueue.asyncAfter(deadline: .now() + MicCapture.reconcileDebounce) { [weak self] in
-            guard let self, self.isRunning, generation == self.reconcileGeneration else { return }
+            guard let self,
+                  self.isRunningAtomic.load(ordering: .acquiring),
+                  generation == self.reconcileGeneration
+            else { return }
             self.reconcile()
         }
     }
@@ -362,7 +389,7 @@ public final class MicCapture: @unchecked Sendable {
     /// no aggregate, no graph reconfiguration, so no -10877 storm and no feedback
     /// loop (we change *our* unit, not the system default).
     private func reconcile() {
-        guard isRunning, let unit else { return }
+        guard isRunningAtomic.load(ordering: .acquiring), let unit else { return }
         let current = (try? MicCapture.defaultInputDevice()) ?? 0
         guard current != 0, current != boundDeviceID else { return }
         // Don't follow the mic onto a Bluetooth input. Activating an AirPods-style

@@ -43,6 +43,25 @@ enum RecordingNotifier {
         }
     }
 
+    /// Post the "we stopped because the disk couldn't keep up" notification —
+    /// the archive stall failsafe fired (sustained loss of recorded audio).
+    static func recordingStalled() {
+        let content = UNMutableNotificationContent()
+        content.title = "Recording stopped"
+        content.body = "Sadi couldn't keep up writing audio to disk, so the recording was stopped and saved."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                log.error("Notification post failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
     /// Post the "we stopped because it went quiet" notification, delivered
     /// immediately (no trigger).
     static func autoStopped(afterMinutes minutes: Int) {

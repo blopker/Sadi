@@ -38,10 +38,15 @@ public final class SystemAudioCapture: @unchecked Sendable {
     /// on the realtime thread, so the rate measures actual delivery, not when the
     /// consumer happened to ask.
     private let lastHostTimeAtomic = Atomic<UInt64>(0)
+    /// Frames the IOProc failed to push because the ring was full. Monotonic
+    /// per `start()`. See `MicCapture.droppedFrames` for the consumer contract.
+    private let droppedFramesAtomic = Atomic<UInt64>(0)
     private var tapID: AudioObjectID = 0
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
-    private var isRunning = false
+    /// Atomic for the same reason as `MicCapture.isRunningAtomic`: `start()`
+    /// and `stop()` run on different (detached) threads with no shared lock.
+    private let isRunningAtomic = Atomic<Bool>(false)
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "systemaudio")
 
@@ -55,6 +60,11 @@ public final class SystemAudioCapture: @unchecked Sendable {
     /// — CoreAudio process taps frequently deliver slightly off-nominal.
     public var framesDelivered: UInt64 {
         framesDeliveredAtomic.load(ordering: .acquiring)
+    }
+
+    /// Cumulative count of frames lost to ring overflow since `start()`.
+    public var droppedFrames: UInt64 {
+        droppedFramesAtomic.load(ordering: .relaxed)
     }
 
     /// Wall-clock-derived delivered rate: `framesDelivered / secondsSinceFirstHost`,
@@ -91,16 +101,16 @@ public final class SystemAudioCapture: @unchecked Sendable {
     public init() throws {
         let format = try SystemAudioCapture.buildTapAndAggregate(into: &tapID, aggregate: &aggregateID)
         self.sampleRate = format.mSampleRate
-        // ~5 s of source-rate audio (~1 MB). See MicCapture.init for the
-        // sizing rationale — long ASR + embedding stalls would otherwise
-        // overflow a 1-second ring during normal operation.
-        let cap = SystemAudioCapture.nextPowerOfTwo(Int(format.mSampleRate.rounded(.up)) * 5)
+        // ~10 s of source-rate audio (~2 MB). See MicCapture.init for the
+        // sizing rationale — headroom for disk-latency spikes; overflow trips
+        // the stall failsafe.
+        let cap = SystemAudioCapture.nextPowerOfTwo(Int(format.mSampleRate.rounded(.up)) * 10)
         self.ring = SPSCRingBuffer(capacity: cap)
     }
 
     deinit {
         // Best-effort teardown if the user forgot stop().
-        if isRunning, let proc = ioProcID {
+        if isRunningAtomic.load(ordering: .acquiring), let proc = ioProcID {
             _ = AudioDeviceStop(aggregateID, proc)
             _ = AudioDeviceDestroyIOProcID(aggregateID, proc)
         }
@@ -170,14 +180,14 @@ public final class SystemAudioCapture: @unchecked Sendable {
     }
 
     public func start() throws {
-        guard !isRunning else { return }
+        guard !isRunningAtomic.load(ordering: .acquiring) else { return }
         try installAndStartIOProc()
-        isRunning = true
+        isRunningAtomic.store(true, ordering: .releasing)
     }
 
     public func stop() {
-        guard isRunning else { return }
-        isRunning = false
+        // Exchange makes a concurrent double-stop single-winner.
+        guard isRunningAtomic.exchange(false, ordering: .acquiringAndReleasing) else { return }
         if let proc = ioProcID {
             _ = AudioDeviceStop(aggregateID, proc)
             _ = AudioDeviceDestroyIOProcID(aggregateID, proc)
@@ -191,6 +201,7 @@ public final class SystemAudioCapture: @unchecked Sendable {
         firstHostTimeAtomic.store(0, ordering: .releasing)
         framesDeliveredAtomic.store(0, ordering: .releasing)
         lastHostTimeAtomic.store(0, ordering: .releasing)
+        droppedFramesAtomic.store(0, ordering: .releasing)
 
         var proc: AudioDeviceIOProcID?
         // Weak self: CoreAudio retains the IOProc block for the lifetime of
@@ -211,7 +222,9 @@ public final class SystemAudioCapture: @unchecked Sendable {
             guard let mData = buf.mData, buf.mDataByteSize > 0 else { return }
             let frames = Int(buf.mDataByteSize) / MemoryLayout<Float>.stride
             let ptr = mData.assumingMemoryBound(to: Float.self)
-            _ = ring.push(data: UnsafeBufferPointer(start: ptr, count: frames))
+            if !ring.push(data: UnsafeBufferPointer(start: ptr, count: frames)) {
+                droppedFramesAtomic.add(UInt64(frames), ordering: .relaxed)
+            }
 
             let hostTime = inInputTime.pointee.mHostTime
             _ = firstHostTimeAtomic.compareExchange(

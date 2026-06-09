@@ -9,16 +9,22 @@ import SwiftUI
 final class RecordingsStore {
     private(set) var items: [RecordingItem] = []
 
-    /// Rescan the recordings root. Cheap (decodes one small JSON per session),
-    /// so we just call it on appear and whenever a recording finishes.
-    func reload() {
+    /// Rescan the recordings root. The directory walk + JSON decodes run off
+    /// the main actor — cheap on a local SSD, but `Data(contentsOf:)` against
+    /// a slow volume must never decide whether the UI beachballs.
+    func reload() async {
+        items = await Task.detached(priority: .userInitiated) {
+            RecordingsStore.scan()
+        }.value
+    }
+
+    nonisolated private static func scan() -> [RecordingItem] {
         let fm = FileManager.default
         guard let root = try? SessionPaths.recordingsRoot(fileManager: fm),
               let dirs = try? fm.contentsOfDirectory(
                 at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         else {
-            items = []
-            return
+            return []
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -31,11 +37,12 @@ final class RecordingsStore {
             loaded.append(RecordingItem(session: session, directory: dir))
         }
         // Newest first.
-        items = loaded.sorted { $0.session.startedAt > $1.session.startedAt }
+        return loaded.sorted { $0.session.startedAt > $1.session.startedAt }
     }
 
     /// Decode a finalized recording's `transcript.json` into utterances.
-    static func loadTranscript(from directory: URL) -> [Utterance] {
+    /// `nonisolated` so callers can (and should) run it off the main actor.
+    nonisolated static func loadTranscript(from directory: URL) -> [Utterance] {
         let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -46,7 +53,9 @@ final class RecordingsStore {
     }
 }
 
-struct RecordingItem: Identifiable, Hashable {
+/// Plain value that crosses between the background scan and the UI —
+/// `nonisolated` so its `Hashable`/`Identifiable` conformances work anywhere.
+nonisolated struct RecordingItem: Identifiable, Hashable, Sendable {
     let session: Session
     let directory: URL
     var id: String { session.id }
@@ -125,16 +134,22 @@ struct RecordingsView: View {
                 }
             }
         }
-        .task { store.reload() }
+        .task { await store.reload() }
         .onChange(of: path) { _, newPath in
             // Back to the root list — drop the lingering row highlight so the
-            // same row can be tapped again immediately.
-            if newPath.isEmpty { selection = nil }
+            // same row can be tapped again immediately. Conditional write: on
+            // a recording stop the isRunning handler below already cleared it
+            // in the same update wave, and writing again would re-trip
+            // SwiftUI's multiple-navigation-updates-per-frame warning.
+            if newPath.isEmpty, selection != nil { selection = nil }
         }
         .onChange(of: controller.isRunning) { wasRunning, isRunning in
             // A recording just finished — its session.json is on disk now.
+            // Clear the selection here too (RootView pops the live screen in
+            // this same wave) so the path handler has nothing left to write.
             if wasRunning && !isRunning {
-                store.reload()
+                selection = nil
+                Task { await store.reload() }
             }
         }
     }
@@ -248,8 +263,10 @@ private struct RecordingDetailView: View {
         }
         .navigationTitle(title)
         .task(id: item.id) {
-            // transcript.json is small; decoding on the main actor is fine.
-            utterances = RecordingsStore.loadTranscript(from: item.directory)
+            let directory = item.directory
+            utterances = await Task.detached(priority: .userInitiated) {
+                RecordingsStore.loadTranscript(from: directory)
+            }.value
             loaded = true
         }
     }

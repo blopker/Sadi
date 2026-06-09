@@ -29,7 +29,15 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     /// a long meeting.
     private let nanosPerFrame: Double
     private static let nanosecondTimescale: CMTimeScale = 1_000_000_000
-    private var framesWritten: Int64 = 0
+    /// Source frames *presented* to the writer — appended or dropped. PTS
+    /// derives from this count, so a dropped chunk leaves a real gap in the
+    /// MP4 timeline instead of silently compressing it: playback positions
+    /// stay wall-clock aligned with the transcript even across drops.
+    private var sourceFrames: Int64 = 0
+    /// Frames dropped because the encoder/disk fell behind
+    /// (`isReadyForMoreMediaData` false) or the writer latched `.failed`.
+    /// Read by the archive loop's stall failsafe; same-thread as `append`.
+    public private(set) var droppedFrames: Int64 = 0
     private var didStart = false
     /// Set once an append fails. `AVAssetWriter` latches to `.failed` on the
     /// first encode error, so every later append would fail too; short-circuit
@@ -107,7 +115,14 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     /// the consumer task; blocks briefly during encode (Apple HW AAC is fast).
     public func append(_ samples: UnsafeBufferPointer<Float>) throws {
         guard samples.count > 0, let base = samples.baseAddress else { return }
-        if didFail { return }
+        let nFrames = samples.count
+        if didFail {
+            // Writer is latched `.failed`; account the loss so the caller's
+            // stall failsafe sees it instead of audio vanishing silently.
+            droppedFrames += Int64(nFrames)
+            sourceFrames += Int64(nFrames)
+            return
+        }
 
         if !didStart {
             guard writer.startWriting() else {
@@ -117,11 +132,14 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
             didStart = true
         }
 
-        // Backpressure: encoder typically keeps up. If it falls behind we drop
-        // — same best-effort posture as the realtime ring.
-        guard input.isReadyForMoreMediaData else { return }
-
-        let nFrames = samples.count
+        // Backpressure: encoder typically keeps up. If it falls behind we
+        // drop — but still advance `sourceFrames`, so the loss shows up as a
+        // PTS gap (timeline preserved) and in `droppedFrames` (failsafe).
+        guard input.isReadyForMoreMediaData else {
+            droppedFrames += Int64(nFrames)
+            sourceFrames += Int64(nFrames)
+            return
+        }
         let dataSize = nFrames * MemoryLayout<Float>.stride
 
         // Copy into a CMBlockBuffer's own memory so we own the lifetime.
@@ -155,7 +173,7 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         // Nanosecond-precision PTS: `value` stays in Double so fractional
         // sample rates round only at the ns floor (sub-microsecond), which
         // can't accumulate over any practical session length.
-        let ptsValue = Int64((Double(framesWritten) * nanosPerFrame).rounded())
+        let ptsValue = Int64((Double(sourceFrames) * nanosPerFrame).rounded())
         let pts = CMTime(value: ptsValue, timescale: SegmentArchiveWriter.nanosecondTimescale)
         var sampleBuffer: CMSampleBuffer?
         let sbStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
@@ -173,9 +191,18 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
 
         if !input.append(sample) {
             didFail = true
+            droppedFrames += Int64(nFrames)
+            sourceFrames += Int64(nFrames)
             throw Error.appendFailed(writer.error as NSError?)
         }
-        framesWritten &+= Int64(nFrames)
+        sourceFrames &+= Int64(nFrames)
+    }
+
+    /// Advance the timeline without data — used when the *capture* side lost
+    /// frames (ring overflow), so subsequent appends keep wall-clock-aligned
+    /// PTS. The skipped span plays back as a gap of the right duration.
+    public func skip(frames: Int) {
+        sourceFrames += Int64(frames)
     }
 
     /// Mark input finished and wait for AVAssetWriter to flush the final

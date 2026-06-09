@@ -61,6 +61,7 @@ final class TranscriptStore {
                 let i = utterances.count - 1
                 utterances[i] = labelSystemUtterance(utterances[i], distinct: seenSystemClusters)
             }
+            reevaluateKeptMic(overlapping: utterance)
             return
         }
         if systemLog.isEmpty {
@@ -79,6 +80,30 @@ final class TranscriptStore {
         case .drop(let reason):
             dropped.append(DroppedUtterance(utterance: utterance, reason: reason))
         }
+    }
+
+    /// Retroactive echo check (SPEC §7). Arrival order at this store is an
+    /// ASR-latency race, not a fact about the audio: bleed by definition
+    /// coincides with system speech, so both segments are usually in flight
+    /// at once — and when the mic side finishes transcribing first, `decide`
+    /// saw an empty overlap set and kept it. On each system arrival, re-run
+    /// the filter over kept mic utterances that overlap it in time and demote
+    /// any the filter now rejects.
+    private func reevaluateKeptMic(overlapping sys: Utterance) {
+        var kept: [Utterance] = []
+        kept.reserveCapacity(utterances.count)
+        for u in utterances {
+            guard u.source == .mic,
+                  EchoFilter.overlapSeconds(u.startedAt...u.endedAt, sys.startedAt...sys.endedAt)
+                      >= filter.minOverlapSeconds,
+                  case .drop(let reason) = filter.decide(mic: u, system: systemLog)
+            else {
+                kept.append(u)
+                continue
+            }
+            dropped.append(DroppedUtterance(utterance: u, reason: reason))
+        }
+        if kept.count != utterances.count { utterances = kept }
     }
 
     /// Live voiceprint resolution (SPEC §8.2). If the utterance carries an

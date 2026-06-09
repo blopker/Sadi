@@ -127,6 +127,21 @@ actor StreamProcessor {
         }
     }
 
+    /// Emit any speech still open when the stream ends (a `speechStart` with
+    /// no `speechEnd` yet) — without this, a recording stopped mid-sentence
+    /// silently loses its final utterance. Called once, after the last `feed`:
+    /// by the inference task when its channel finishes, and by the CLI replay
+    /// driver after the last chunk.
+    ///
+    /// Only audio that has been through the VAD is flushed; a sub-chunk
+    /// remainder still sitting in `pending16k` (< ~256 ms) is below the
+    /// 300 ms minimum segment length and is dropped with the stream.
+    func flush() async {
+        guard let start = pendingSpeechStart else { return }
+        pendingSpeechStart = nil
+        await emit(absoluteStart: start, absoluteEnd: Int64(streamState.processedSamples))
+    }
+
     private func advance(chunk: [Float]) async {
         let stepResult: VadStreamResult
         do {

@@ -38,17 +38,15 @@ final class SpeakersModel {
     /// "Which recordings is a speaker in?" is derived from each session's saved
     /// `transcript.json`: utterances resolved to a voiceprint carry
     /// `.named(name, voiceprintID)`. (Session-level `speakerClusters` aren't
-    /// populated by the live pipeline yet — see `SpeakerCluster`.)
-    func reload() {
-        store.reload()
-        var index: [UUID: [RecordingItem]] = [:]
-        for item in store.items {
-            let ids = Set(RecordingsStore.loadTranscript(from: item.directory).compactMap { utterance -> UUID? in
-                if case .named(_, let voiceprintID) = utterance.speaker { return voiceprintID }
-                return nil
-            })
-            for id in ids { index[id, default: []].append(item) }
-        }
+    /// populated by the live pipeline yet — see `SpeakerCluster`.) That means
+    /// reading *every* transcript of *every* recording — O(library size) disk
+    /// I/O — so the scan runs off the main actor.
+    func reload() async {
+        await store.reload()
+        let items = store.items
+        let index = await Task.detached(priority: .userInitiated) {
+            SpeakersModel.speakerIndex(items: items)
+        }.value
         // store.items is already newest-first, so each bucket inherits that order.
         speakers = voiceprints.prints
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -63,9 +61,21 @@ final class SpeakersModel {
             }
     }
 
-    func delete(id: UUID) {
+    nonisolated private static func speakerIndex(items: [RecordingItem]) -> [UUID: [RecordingItem]] {
+        var index: [UUID: [RecordingItem]] = [:]
+        for item in items {
+            let ids = Set(RecordingsStore.loadTranscript(from: item.directory).compactMap { utterance -> UUID? in
+                if case .named(_, let voiceprintID) = utterance.speaker { return voiceprintID }
+                return nil
+            })
+            for id in ids { index[id, default: []].append(item) }
+        }
+        return index
+    }
+
+    func delete(id: UUID) async {
         try? voiceprints.delete(id: id)
-        reload()
+        await reload()
     }
 }
 
@@ -107,7 +117,7 @@ struct SpeakersView: View {
         }
         .navigationTitle("Speakers")
         .task {
-            model.reload()
+            await model.reload()
             selectCurrentOrFirst()
         }
     }
@@ -119,8 +129,10 @@ struct SpeakersView: View {
                     .tag(speaker.id)
                     .contextMenu {
                         Button("Delete", role: .destructive) {
-                            model.delete(id: speaker.id)
-                            selectCurrentOrFirst()
+                            Task {
+                                await model.delete(id: speaker.id)
+                                selectCurrentOrFirst()
+                            }
                         }
                     }
             }

@@ -96,5 +96,11 @@ enum FileReplayDriver {
             }
             elapsed = nextElapsed
         }
+
+        // Mirror the live pipeline's end-of-stream flush so speech still open
+        // at the end of a track isn't dropped.
+        for (proc, _) in processors {
+            await proc.flush()
+        }
     }
 }

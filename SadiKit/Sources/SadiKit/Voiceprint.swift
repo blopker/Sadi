@@ -154,11 +154,11 @@ public final class VoiceprintBook {
             withIntermediateDirectories: true
         )
         let data = try JSONEncoder().encode(prints)
-        let tmp = storeURL.appendingPathExtension("tmp")
-        try data.write(to: tmp, options: [.atomic])
-        // Rename overwrites — POSIX guarantees no half-written final file.
-        _ = try? FileManager.default.removeItem(at: storeURL)
-        try FileManager.default.moveItem(at: tmp, to: storeURL)
+        // `.atomic` is a temp-file write + rename(2) under the hood: a partial
+        // write can never replace a good file, and — unlike a manual
+        // remove + move — there is no instant where the book is missing from
+        // disk for a crash to land in.
+        try data.write(to: storeURL, options: [.atomic])
     }
 
     // MARK: - Distance
