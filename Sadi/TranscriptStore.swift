@@ -11,6 +11,11 @@ import SadiKit
 final class TranscriptStore {
     private(set) var utterances: [Utterance] = []
     private(set) var dropped: [DroppedUtterance] = []
+    /// Wall-clock time of the most recent transcribed utterance (kept or
+    /// dropped) — i.e. the last time speech was heard. Seeded at `reset()` to
+    /// the session start so a recording that never produces speech still has a
+    /// well-defined idle clock for the auto-stop monitor.
+    private(set) var lastActivityAt = Date()
     private var systemLog: [Utterance] = []
     private let filter = EchoFilter()
     private let voiceprints: VoiceprintBook
@@ -32,6 +37,9 @@ final class TranscriptStore {
     /// in call mode all mic clusters fold to `.you`; in mic-only mode the
     /// StreamProcessor's `.localSpeaker(N)` survives.
     func receive(_ utterance: Utterance) {
+        // Any transcribed utterance — kept or echo-filtered — counts as speech
+        // activity for the idle auto-stop clock.
+        lastActivityAt = Date()
         if utterance.source == .system {
             systemLog.append(utterance)
             // StreamProcessor emits a `.them` placeholder; this store owns the
@@ -109,6 +117,7 @@ final class TranscriptStore {
         dropped.removeAll()
         systemLog.removeAll()
         seenSystemClusters.removeAll()
+        lastActivityAt = Date()
     }
 
     /// Re-resolve every existing utterance against the current voiceprint
@@ -127,24 +136,34 @@ final class TranscriptStore {
     /// Not a crash-recovery mechanism — a force-quit or crash never reaches
     /// here. The session's fragmented MP4s remain the source of truth and the
     /// transcript can be re-derived from them (transcription is cheap).
-    func writeTranscript(to directory: URL) throws {
+    func writeTranscript(to directory: URL) async throws {
+        // Snapshot the main-actor state here, then hand the encode + atomic write
+        // to a detached task so the JSON work and disk I/O stay off the main
+        // thread — matching how `stop()` offloads the rest of its teardown.
+        // `TranscriptDocument` is `Sendable`, so it crosses into the task safely.
         let doc = TranscriptDocument(
             schemaVersion: 1,
             sessionID: directory.lastPathComponent,
             utterances: utterances
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(doc)
         let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
-        try data.write(to: url, options: .atomic)
+        try await Task.detached(priority: .userInitiated) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(doc)
+            try data.write(to: url, options: .atomic)
+        }.value
     }
 }
 
 /// On-disk shape of `transcript.json`. `schemaVersion` lets a later reader
 /// migrate older files; `Utterance` is already `Codable` (SadiKit).
-struct TranscriptDocument: Codable {
+/// `nonisolated` so its `Codable` conformance can run off the main actor (the
+/// app builds with default main-actor isolation). `writeTranscript` encodes it
+/// inside a detached task; `RecordingsStore` decodes it. Members are all value
+/// types from SadiKit, so this is safe.
+nonisolated struct TranscriptDocument: Codable, Sendable {
     let schemaVersion: Int
     let sessionID: String
     let utterances: [Utterance]

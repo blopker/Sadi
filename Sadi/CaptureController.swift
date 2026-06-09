@@ -30,6 +30,7 @@ final class CaptureController {
     private var micConsumer: Task<Void, Never>?
     private var systemConsumer: Task<Void, Never>?
     private var systemStartTask: Task<Void, Never>?
+    private var idleMonitor: Task<Void, Never>?
     private var sessionDirectory: URL?
     private var sessionStartWallClock: Date?
     // Filenames of the segment archives actually opened this session, recorded
@@ -72,6 +73,7 @@ final class CaptureController {
         sessionStartWallClock = startWallClock
         transcript.reset()
         isRunning = true
+        idleMonitor = startIdleMonitor()
 
         // Mic pipeline.
         do {
@@ -139,6 +141,28 @@ final class CaptureController {
         }
     }
 
+    /// Watch the transcript's last-activity timestamp and stop the recording
+    /// once it's been idle longer than the user's auto-stop window, posting a
+    /// local notification when it fires. The setting is re-read every tick, so
+    /// toggling auto-stop (or changing its duration) mid-recording takes effect.
+    /// Polling at a coarse interval is plenty — the window is minutes.
+    private func startIdleMonitor() -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                let config = AutoStopSettings.current()
+                guard config.enabled else { continue }
+                let idle = Date().timeIntervalSince(self.transcript.lastActivityAt)
+                guard idle >= Double(config.minutes) * 60 else { continue }
+                Self.log.notice("Auto-stop: idle \(Int(idle))s ≥ \(config.minutes)m — stopping")
+                await self.stop()
+                RecordingNotifier.autoStopped(afterMinutes: config.minutes)
+                return
+            }
+        }
+    }
+
     /// Build and start the system-audio pipeline. Split out of `start()` so it
     /// can run after the mic has settled (see the deferred task in `start`).
     private func startSystemPipeline(
@@ -194,6 +218,10 @@ final class CaptureController {
         guard isRunning else { return }
         // Stamp the end the moment the user stopped, before the finalize awaits.
         let endedAt = Date()
+        // Stop the idle monitor. Cancel-only (no `await`): when auto-stop fires,
+        // the monitor task is the caller, so awaiting its value would deadlock.
+        idleMonitor?.cancel()
+        idleMonitor = nil
         // Cancel the deferred system start and wait it out, so it can't bring a
         // system pipeline up after we've begun tearing down. `isRunning` stays
         // true until the end here, which also blocks a re-`start()` race.

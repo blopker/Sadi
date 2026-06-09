@@ -3,6 +3,7 @@ import Foundation
 import OSLog
 import SadiKit
 import SwiftUI
+import UserNotifications
 
 /// Single binary, two faces. `Sadi cli …` runs the transcription pipeline
 /// headless (see `SadiCLI`); anything else launches the SwiftUI app. The CLI
@@ -24,10 +25,36 @@ struct AppEntry {
 /// written — before the process exits. A force-quit or crash bypasses this;
 /// the fragmented MP4s remain re-derivable in that case.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     weak var controller: CaptureController?
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "lifecycle")
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Receive notification interactions in-process so a click focuses the
+        // running app (paired with LSMultipleInstancesProhibited, which stops a
+        // second instance from being launched) rather than spawning a new one.
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    /// Show our notifications as banners even when Sadi is frontmost.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+
+    /// A click on the notification: bring the existing window forward.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where window.canBecomeMain {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controller, controller.isRunning else { return .terminateNow }
@@ -74,6 +101,11 @@ struct SadiApp: App {
             .frame(minWidth: 900, minHeight: 520)
             .task {
                 appDelegate.controller = controller
+                // Pre-warm notification permission for returning users who
+                // already have auto-stop on, so the first auto-stop can notify.
+                if AutoStopSettings.current().enabled {
+                    RecordingNotifier.requestAuthorization()
+                }
                 await modelHost.loadIfNeeded()
             }
         }

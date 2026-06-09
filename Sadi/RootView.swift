@@ -149,12 +149,35 @@ private struct SettingsView: View {
     @AppStorage("settings.showDroppedByDefault") private var showDroppedByDefault = false
     @AppStorage("settings.launchAtLogin") private var launchAtLogin = false
     @AppStorage("settings.playChimeOnStop") private var playChimeOnStop = false
+    @AppStorage(AutoStopSettings.enabledKey) private var autoStopEnabled = false
+    @AppStorage(AutoStopSettings.minutesKey) private var autoStopMinutes = AutoStopSettings
+        .defaultMinutes
 
     var body: some View {
         Form {
             Section("Transcription") {
                 Toggle("Show echo-filtered utterances by default", isOn: $showDroppedByDefault)
                 Toggle("Play a chime when a recording stops", isOn: $playChimeOnStop)
+            }
+
+            Section {
+                Toggle("Auto-stop when idle", isOn: $autoStopEnabled)
+                if autoStopEnabled {
+                    Picker("Stop after a silence of", selection: $autoStopMinutes) {
+                        ForEach(AutoStopSettings.presetMinutes, id: \.self) { minutes in
+                            Text("\(minutes) minute\(minutes == 1 ? "" : "s")").tag(minutes)
+                        }
+                    }
+                }
+            } header: {
+                Text("Recording")
+            } footer: {
+                Text("Auto stop the recording if a long silence is detected.")
+            }
+            .onChange(of: autoStopEnabled) { _, enabled in
+                // Tie the notification permission prompt to turning the feature
+                // on, rather than nagging everyone at launch.
+                if enabled { RecordingNotifier.requestAuthorization() }
             }
 
             Section("General") {
