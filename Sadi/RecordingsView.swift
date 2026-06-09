@@ -141,7 +141,9 @@ struct RecordingsView: View {
     }
 }
 
-private struct RecordingRow: View {
+/// Compact recording summary row. Used by the Recordings list and reused by the
+/// Speakers detail panel's per-speaker recording list.
+struct RecordingRow: View {
     let item: RecordingItem
 
     var body: some View {

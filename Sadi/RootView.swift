@@ -67,7 +67,13 @@ struct RootView: View {
                 path: $recordingsPath
             )
         case .speakers:
-            SpeakersView(voiceprints: voiceprints)
+            SpeakersView(voiceprints: voiceprints) { item in
+                // Reuse the Recordings tab's stack to show the detail: switch
+                // tabs and push the recording so the same screen/back-stack
+                // serves both entry points.
+                selection = .recordings
+                recordingsPath = [.detail(item)]
+            }
         case .settings:
             SettingsView(modelHost: modelHost)
         }
@@ -130,59 +136,6 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         case .speakers: "person.2"
         case .settings: "gearshape"
         }
-    }
-}
-
-// MARK: - Speakers (mock, real voiceprint data)
-
-/// Lists enrolled voiceprints. Real data from `VoiceprintBook`; delete is wired
-/// up, the rest (merge, re-record, listen) is future work.
-private struct SpeakersView: View {
-    let voiceprints: VoiceprintBook
-
-    var body: some View {
-        Group {
-            if voiceprints.prints.isEmpty {
-                ContentUnavailableView(
-                    "No speakers yet",
-                    systemImage: "person.crop.circle.badge.questionmark",
-                    description: Text("Name a speaker in a transcript to enroll their voiceprint.")
-                )
-            } else {
-                List {
-                    ForEach(voiceprints.prints.sorted(by: { $0.name < $1.name })) { print in
-                        SpeakerRow(voiceprint: print)
-                            .contextMenu {
-                                Button("Delete", role: .destructive) {
-                                    try? voiceprints.delete(id: print.id)
-                                }
-                            }
-                    }
-                }
-            }
-        }
-        .navigationTitle("Speakers")
-    }
-}
-
-private struct SpeakerRow: View {
-    let voiceprint: Voiceprint
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "person.crop.circle.fill")
-                .font(.title)
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(voiceprint.name)
-                    .font(.headline)
-                Text("\(voiceprint.sampleCount) sample\(voiceprint.sampleCount == 1 ? "" : "s") · enrolled \(voiceprint.createdAt.formatted(date: .abbreviated, time: .omitted))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .padding(.vertical, 4)
     }
 }
 
