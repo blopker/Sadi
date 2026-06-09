@@ -1,4 +1,3 @@
-import AVFoundation
 import SadiKit
 import SwiftUI
 
@@ -58,27 +57,30 @@ struct RecordingItem: Identifiable, Hashable {
 
 // MARK: - Recordings list
 
+/// Navigation routes within the Recordings tab. Lifted to file scope (and the
+/// path binding to `RootView`) so the app-wide record button can push the live
+/// screen from any tab.
+enum RecordingsRoute: Hashable {
+    case live
+    case detail(RecordingItem)
+}
+
 struct RecordingsView: View {
     let modelHost: ModelHost
     let transcript: TranscriptStore
     let voiceprints: VoiceprintBook
     let controller: CaptureController
+    let canStart: Bool
+    @Binding var path: [RecordingsRoute]
 
     @State private var store = RecordingsStore()
-    @State private var path: [Route] = []
-    @State private var micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
-
-    private enum Route: Hashable {
-        case live
-        case detail(RecordingItem)
-    }
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
                 if controller.isRunning {
                     Section {
-                        NavigationLink(value: Route.live) {
+                        NavigationLink(value: RecordingsRoute.live) {
                             Label {
                                 Text("Recording in progress")
                             } icon: {
@@ -94,7 +96,7 @@ struct RecordingsView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(store.items) { item in
-                            NavigationLink(value: Route.detail(item)) {
+                            NavigationLink(value: RecordingsRoute.detail(item)) {
                                 RecordingRow(item: item)
                             }
                         }
@@ -102,7 +104,7 @@ struct RecordingsView: View {
                 }
             }
             .navigationTitle("Recordings")
-            .navigationDestination(for: Route.self) { route in
+            .navigationDestination(for: RecordingsRoute.self) { route in
                 switch route {
                 case .live:
                     ContentView(
@@ -112,54 +114,30 @@ struct RecordingsView: View {
                         controller: controller
                     )
                     .navigationTitle("Recording")
+                    .toolbar { ToolbarItem(placement: .primaryAction) { recordButton } }
                 case .detail(let item):
                     RecordingDetailView(item: item)
-                }
-            }
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    recordButton
+                        .toolbar { ToolbarItem(placement: .primaryAction) { recordButton } }
                 }
             }
         }
-        .task {
-            if micAuthorization == .notDetermined {
-                _ = await AVCaptureDevice.requestAccess(for: .audio)
-                micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
-            }
-            store.reload()
-        }
+        .task { store.reload() }
         .onChange(of: controller.isRunning) { wasRunning, isRunning in
             // A recording just finished — its session.json is on disk now.
             if wasRunning && !isRunning {
                 store.reload()
-                path.removeAll()
             }
         }
     }
 
-    @ViewBuilder
+    // Same control as the app-wide toolbar, re-attached to the pushed live /
+    // detail screens (a NavigationStack hides the outer detail toolbar once a
+    // destination is pushed). Already inside Recordings, so starting just
+    // pushes the live screen.
     private var recordButton: some View {
-        if controller.isRunning {
-            Button {
-                Task { await controller.stop() }
-            } label: {
-                Label("Stop", systemImage: "stop.fill")
-            }
-            .tint(.red)
-        } else {
-            Button {
-                controller.start()
-                path = [.live]
-            } label: {
-                Label("Record", systemImage: "record.circle")
-            }
-            .disabled(!canStart)
+        RecordButton(controller: controller, canStart: canStart) {
+            path = [.live]
         }
-    }
-
-    private var canStart: Bool {
-        micAuthorization == .authorized && modelHost.state == .ready
     }
 }
 

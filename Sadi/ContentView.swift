@@ -49,21 +49,7 @@ struct ContentView: View {
                 .controlSize(.small)
                 .help("Show utterances filtered out as echo bleed (\(transcript.dropped.count))")
             modelStatusView
-            Button(controller.isRunning ? "Stop" : "Start") {
-                if controller.isRunning {
-                    Task { await controller.stop() }
-                } else {
-                    controller.start()
-                }
-            }
-            .keyboardShortcut("r", modifiers: [.command])
-            .disabled(!canStart)
         }
-    }
-
-    private var canStart: Bool {
-        if controller.isRunning { return true }
-        return micAuthorization == .authorized && modelHost.state == .ready
     }
 
     @ViewBuilder
