@@ -110,18 +110,24 @@ enum OfflinePipeline {
                     .filter { $0.assignmentKind == .manual }
             }.value
             progress("Transcribing…")
-            var fresh: [Utterance] = []
-            for track in tracks {
-                let label = track.source == .mic ? "mic" : "system"
-                progress("Transcribing \(label)…")
-                let diarSegments = diar[track.source] ?? []
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try await transcribe(
-                        track: track, diar: diarSegments, vad: vad, asrModels: asrModels,
-                        embedder: embedder)
-                }.value
-                fresh.append(contentsOf: result)
-            }
+            // Both tracks at once; each track internally fans its segments
+            // out over an ASR worker pool (see `transcribe`).
+            let diarSnapshot = diar
+            let trackSnapshot = tracks
+            let fresh = try await Task.detached(priority: .userInitiated) {
+                try await withThrowingTaskGroup(of: [Utterance].self) { group in
+                    for track in trackSnapshot {
+                        group.addTask {
+                            try await transcribe(
+                                track: track, diar: diarSnapshot[track.source] ?? [],
+                                vad: vad, asrModels: asrModels, embedder: embedder)
+                        }
+                    }
+                    var all: [Utterance] = []
+                    for try await result in group { all.append(contentsOf: result) }
+                    return all
+                }
+            }.value
             utterances = pinned + fresh.filter { u in
                 !pinned.contains { p in
                     p.source == u.source
@@ -288,50 +294,69 @@ enum OfflinePipeline {
 
     // MARK: - Diarization
 
-    /// Run offline diarization per track. Tracks are independent cluster
-    /// namespaces (matching the live pipeline's source-local `diarCluster`),
-    /// and FluidAudio's string speaker ids are re-mapped to Ints by first
-    /// appearance order.
+    /// Run offline diarization, tracks in parallel. Tracks are independent
+    /// cluster namespaces (matching the live pipeline's source-local
+    /// `diarCluster`), each with its own (non-Sendable) manager built from
+    /// the shared Sendable model set. FluidAudio's string speaker ids are
+    /// re-mapped to Ints by first appearance order.
     nonisolated private static func diarize(
         tracks: [Track], models: OfflineDiarizerModels
     ) async throws -> [Source: [DiarSegment]] {
-        let manager = OfflineDiarizerManager()
-        manager.initialize(models: models)
-        var out: [Source: [DiarSegment]] = [:]
-        for track in tracks {
-            let result = try await manager.process(audio: track.samples)
-            var clusterIds: [String: Int] = [:]
-            var segments: [DiarSegment] = []
-            for seg in result.segments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }) {
-                let id: Int
-                if let existing = clusterIds[seg.speakerId] {
-                    id = existing
-                } else {
-                    id = clusterIds.count
-                    clusterIds[seg.speakerId] = id
+        try await withThrowingTaskGroup(of: (Source, [DiarSegment]).self) { group in
+            for track in tracks {
+                group.addTask {
+                    let manager = OfflineDiarizerManager()
+                    manager.initialize(models: models)
+                    let result = try await manager.process(audio: track.samples)
+                    var clusterIds: [String: Int] = [:]
+                    var segments: [DiarSegment] = []
+                    for seg in result.segments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }) {
+                        let id: Int
+                        if let existing = clusterIds[seg.speakerId] {
+                            id = existing
+                        } else {
+                            id = clusterIds.count
+                            clusterIds[seg.speakerId] = id
+                        }
+                        segments.append(
+                            DiarSegment(
+                                cluster: id,
+                                startSec: Double(seg.startTimeSeconds),
+                                endSec: Double(seg.endTimeSeconds),
+                                quality: seg.qualityScore
+                            ))
+                    }
+                    Self.log.info(
+                        "Offline diarization (\(track.source == .mic ? "mic" : "system", privacy: .public)): \(segments.count) segments, \(clusterIds.count) speakers"
+                    )
+                    return (track.source, segments)
                 }
-                segments.append(
-                    DiarSegment(
-                        cluster: id,
-                        startSec: Double(seg.startTimeSeconds),
-                        endSec: Double(seg.endTimeSeconds),
-                        quality: seg.qualityScore
-                    ))
             }
-            out[track.source] = segments
-            Self.log.info(
-                "Offline diarization (\(track.source == .mic ? "mic" : "system", privacy: .public)): \(segments.count) segments, \(clusterIds.count) speakers"
-            )
+            var out: [Source: [DiarSegment]] = [:]
+            for try await (source, segments) in group {
+                out[source] = segments
+            }
+            return out
         }
-        return out
     }
 
     // MARK: - Rerun transcription
 
+    /// ASR worker tasks per track. Each worker owns its own `AsrManager`
+    /// against the shared `AsrModels` weights — the exact concurrency shape
+    /// the live pipeline already runs (one manager per stream). The ANE
+    /// serializes its own requests, but decoder/token CPU work between ANE
+    /// calls pipelines, so a few workers recover most of the idle time;
+    /// past ~4 the ANE is saturated and more just burn memory.
+    nonisolated private static let asrWorkersPerTrack = 4
+
     /// Full from-audio transcription of one track: whole-file VAD
-    /// segmentation → batch ASR per segment → split into speaker-coherent
+    /// segmentation (sequential — the VAD RNN is stateful) → batch ASR over
+    /// the segments on a small worker pool → split into speaker-coherent
     /// runs against the *offline* diarizer timeline (the live pipeline does
-    /// the same against LS-EEND). Mirrors `StreamProcessor.emit`.
+    /// the same against LS-EEND). Mirrors `StreamProcessor.emit`; output
+    /// order is restored by segment index, so parallelism never reorders
+    /// the transcript.
     nonisolated private static func transcribe(
         track: Track,
         diar: [DiarSegment],
@@ -341,61 +366,95 @@ enum OfflinePipeline {
     ) async throws -> [Utterance] {
         let rate = Resampler.targetRate  // 16_000
         let minSpeechSamples = Int(rate * 0.3)
-        let asr = AsrManager(config: .default, models: asrModels)
-        let segments = try await vad.segmentSpeech(track.samples)
-        var out: [Utterance] = []
-
-        for seg in segments {
+        let segments = try await vad.segmentSpeech(track.samples).filter { seg in
             let lo = max(0, Int(seg.startTime * rate))
             let hi = min(track.samples.count, Int(seg.endTime * rate))
-            guard hi - lo >= minSpeechSamples else { continue }
-            let segmentSamples = Array(track.samples[lo..<hi])
+            return hi - lo >= minSpeechSamples
+        }
+        guard !segments.isEmpty else { return [] }
 
-            var decoderState = try TdtDecoderState()
-            let result = try await asr.transcribe(segmentSamples, decoderState: &decoderState)
-            let fullText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !fullText.isEmpty else { continue }
-
-            guard let timings = result.tokenTimings, !timings.isEmpty else {
-                let cluster = dominantCluster(
-                    startSec: seg.startTime, endSec: seg.endTime, in: diar)
-                out.append(
-                    makeUtterance(
-                        track: track, text: fullText, words: nil,
-                        runAudio: segmentSamples, fallbackAudio: segmentSamples,
-                        startSec: seg.startTime, endSec: seg.endTime,
-                        cluster: cluster, confidence: result.confidence, embedder: embedder
-                    ))
-                continue
+        let workers = min(asrWorkersPerTrack, segments.count)
+        let indexed: [[(Int, [Utterance])]] = try await withThrowingTaskGroup(
+            of: [(Int, [Utterance])].self
+        ) { group in
+            for w in 0..<workers {
+                group.addTask {
+                    let asr = AsrManager(config: .default, models: asrModels)
+                    var results: [(Int, [Utterance])] = []
+                    for i in stride(from: w, to: segments.count, by: workers) {
+                        let utterances = try await transcribeSegment(
+                            segments[i], track: track, diar: diar, asr: asr,
+                            embedder: embedder)
+                        results.append((i, utterances))
+                    }
+                    return results
+                }
             }
+            var all: [[(Int, [Utterance])]] = []
+            for try await chunk in group { all.append(chunk) }
+            return all
+        }
+        return indexed.flatMap { $0 }.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+    }
 
-            let words = AsrWords.group(timings)
-            let runs = SpeakerSegmenter.splitIntoRuns(
-                tokens: words,
-                speakerAt: { wordTimeRelative in
-                    clusterAt(timeSec: seg.startTime + wordTimeRelative, in: diar)
-                },
-                minTokensPerRun: 2
-            )
-            for run in runs {
-                let runText = run.text
-                if runText.isEmpty { continue }
-                let runStartIdx = max(0, Int(run.startTime * rate))
-                let runEndIdx = min(segmentSamples.count, Int(run.endTime * rate))
-                let runAudio =
-                    runEndIdx > runStartIdx
-                    ? Array(segmentSamples[runStartIdx..<runEndIdx])
-                    : segmentSamples
-                out.append(
-                    makeUtterance(
-                        track: track, text: runText, words: run.tokens,
-                        runAudio: runAudio, fallbackAudio: segmentSamples,
-                        startSec: seg.startTime + run.startTime,
-                        endSec: seg.startTime + run.endTime,
-                        cluster: run.speakerIndex, confidence: result.confidence,
-                        embedder: embedder
-                    ))
-            }
+    /// One VAD segment through ASR and run-splitting — the unit of work the
+    /// transcription pool distributes.
+    nonisolated private static func transcribeSegment(
+        _ seg: VadSegment,
+        track: Track,
+        diar: [DiarSegment],
+        asr: AsrManager,
+        embedder: DiarizerManager
+    ) async throws -> [Utterance] {
+        let rate = Resampler.targetRate
+        let lo = max(0, Int(seg.startTime * rate))
+        let hi = min(track.samples.count, Int(seg.endTime * rate))
+        let segmentSamples = Array(track.samples[lo..<hi])
+
+        var decoderState = try TdtDecoderState()
+        let result = try await asr.transcribe(segmentSamples, decoderState: &decoderState)
+        let fullText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fullText.isEmpty else { return [] }
+
+        guard let timings = result.tokenTimings, !timings.isEmpty else {
+            let cluster = dominantCluster(startSec: seg.startTime, endSec: seg.endTime, in: diar)
+            return [
+                makeUtterance(
+                    track: track, text: fullText, words: nil,
+                    runAudio: segmentSamples, fallbackAudio: segmentSamples,
+                    startSec: seg.startTime, endSec: seg.endTime,
+                    cluster: cluster, confidence: result.confidence, embedder: embedder
+                )
+            ]
+        }
+
+        let words = AsrWords.group(timings)
+        let runs = SpeakerSegmenter.splitIntoRuns(
+            tokens: words,
+            speakerAt: { wordTimeRelative in
+                clusterAt(timeSec: seg.startTime + wordTimeRelative, in: diar)
+            },
+            minTokensPerRun: 2
+        )
+        var out: [Utterance] = []
+        for run in runs {
+            let runText = run.text
+            if runText.isEmpty { continue }
+            let runStartIdx = max(0, Int(run.startTime * rate))
+            let runEndIdx = min(segmentSamples.count, Int(run.endTime * rate))
+            let runAudio =
+                runEndIdx > runStartIdx
+                ? Array(segmentSamples[runStartIdx..<runEndIdx])
+                : segmentSamples
+            out.append(
+                makeUtterance(
+                    track: track, text: runText, words: run.tokens,
+                    runAudio: runAudio, fallbackAudio: segmentSamples,
+                    startSec: seg.startTime + run.startTime,
+                    endSec: seg.startTime + run.endTime,
+                    cluster: run.speakerIndex, confidence: result.confidence,
+                    embedder: embedder
+                ))
         }
         return out
     }
