@@ -205,6 +205,7 @@ actor StreamProcessor {
                 let speaker = label(source: source, cluster: cluster)
                 await emitUtterance(
                     text: fullText,
+                    words: nil,
                     runAudio: segmentSamples,
                     fallbackAudio: segmentSamples,
                     runStartSample: absoluteStart,
@@ -244,6 +245,7 @@ actor StreamProcessor {
                 let speaker = label(source: source, cluster: run.speakerIndex)
                 await emitUtterance(
                     text: runText,
+                    words: run.tokens,
                     runAudio: runAudio,
                     fallbackAudio: segmentSamples,
                     runStartSample: runStartSample,
@@ -260,6 +262,7 @@ actor StreamProcessor {
 
     private func emitUtterance(
         text: String,
+        words: [TimedToken]?,
         runAudio: [Float],
         fallbackAudio: [Float],
         runStartSample: Int64,
@@ -274,9 +277,25 @@ actor StreamProcessor {
 
         // 256-dim WeSpeaker embedding for voiceprint matching (SPEC §8).
         // Need ≥300 ms of audio for a stable embedding; for shorter runs we
-        // fall back to the whole VAD-segment slice.
-        let embedAudio = runAudio.count >= 4_800 ? runAudio : fallbackAudio
+        // fall back to the whole VAD-segment slice — flagged ambiguous, since
+        // the wider slice may contain other speakers.
+        let usedFallback = runAudio.count < 4_800 && fallbackAudio.count > runAudio.count
+        let embedAudio = usedFallback ? fallbackAudio : runAudio
         let embedding = try? embeddingDiarizer.extractSpeakerEmbedding(from: embedAudio)
+
+        // Persist word timings re-based from segment-relative to
+        // utterance-relative seconds (token times are relative to the VAD
+        // segment; the utterance starts at the run's first token).
+        let timings = words.map { ws -> [WordTiming] in
+            let base = ws.first?.startTime ?? 0
+            return ws.map { tok in
+                WordTiming(
+                    word: tok.text.trimmingCharacters(in: .whitespaces),
+                    start: tok.startTime - base,
+                    end: tok.endTime - base
+                )
+            }
+        }
 
         let utterance = Utterance(
             source: source,
@@ -287,7 +306,10 @@ actor StreamProcessor {
             embedding: embedding,
             asrConfidence: confidence,
             rms: rms,
-            diarCluster: cluster
+            diarCluster: cluster,
+            wordTimings: timings,
+            assignmentKind: .auto,
+            embeddingAmbiguous: embedding == nil ? nil : usedFallback
         )
         await store.receive(utterance)
     }

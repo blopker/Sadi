@@ -22,6 +22,18 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
     /// the diarizer's finalized timeline. `nil` when the diarizer pinned no
     /// cluster for the segment, or for older persisted transcripts.
     public var diarCluster: Int?
+    /// Per-word timings from the ASR, seconds relative to `startedAt`.
+    /// `nil` when the model returned no token timings, or for older
+    /// persisted transcripts.
+    public var wordTimings: [WordTiming]?
+    /// How `speaker` was decided — see `AssignmentKind`. `nil` (older
+    /// transcripts) reads as `.auto`.
+    public var assignmentKind: AssignmentKind?
+    /// True when `embedding` was computed over more audio than this
+    /// utterance's own run (sub-300 ms runs fall back to the whole VAD
+    /// segment, which may contain other speakers). Re-attribution passes
+    /// should weight ambiguous embeddings accordingly.
+    public var embeddingAmbiguous: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -33,7 +45,10 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
         embedding: [Float]? = nil,
         asrConfidence: Float? = nil,
         rms: Float? = nil,
-        diarCluster: Int? = nil
+        diarCluster: Int? = nil,
+        wordTimings: [WordTiming]? = nil,
+        assignmentKind: AssignmentKind? = nil,
+        embeddingAmbiguous: Bool? = nil
     ) {
         self.id = id
         self.source = source
@@ -45,7 +60,38 @@ public struct Utterance: Identifiable, Hashable, Sendable, Codable {
         self.asrConfidence = asrConfidence
         self.rms = rms
         self.diarCluster = diarCluster
+        self.wordTimings = wordTimings
+        self.assignmentKind = assignmentKind
+        self.embeddingAmbiguous = embeddingAmbiguous
     }
+}
+
+/// One word's position within an utterance, seconds relative to the
+/// utterance's `startedAt`. Persisted so later passes (click-to-seek,
+/// re-diarization by overlap) don't need to re-run ASR.
+public struct WordTiming: Hashable, Sendable, Codable {
+    public let word: String
+    public let start: TimeInterval
+    public let end: TimeInterval
+
+    public init(word: String, start: TimeInterval, end: TimeInterval) {
+        self.word = word
+        self.start = start
+        self.end = end
+    }
+}
+
+/// Provenance of an `Utterance.speaker` label. The contract every
+/// transcript-rewriting pass must honor:
+///   - `manual`  — the user pinned this specific utterance; no automated
+///                 pass (finalize, rerun, re-attribution) may change it.
+///   - `matched` — derived by embedding match against the voiceprint book;
+///                 free to be re-derived by any later, better pass.
+///   - `auto`    — bare diarizer cluster label, no persistent identity.
+public enum AssignmentKind: String, Hashable, Sendable, Codable {
+    case manual
+    case matched
+    case auto
 }
 
 public enum Source: String, Hashable, Sendable, Codable {

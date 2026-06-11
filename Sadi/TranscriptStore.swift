@@ -108,13 +108,17 @@ final class TranscriptStore {
 
     /// Live voiceprint resolution (SPEC §8.2). If the utterance carries an
     /// embedding and matches an enrolled voiceprint within `matchThreshold`,
-    /// replace the speaker label with `.named`. Otherwise pass through.
+    /// replace the speaker label with `.named` and stamp `matched` provenance.
+    /// `manual` utterances are never touched — that's the user's pin, and the
+    /// AssignmentKind contract says only the user may move it.
     private func resolveVoiceprint(_ u: Utterance) -> Utterance {
-        guard let embedding = u.embedding,
+        guard u.assignmentKind != .manual,
+              let embedding = u.embedding,
               let match = voiceprints.match(embedding: embedding)
         else { return u }
         var copy = u
         copy.speaker = .named(match.voiceprint.name, match.voiceprint.id)
+        copy.assignmentKind = .matched
         return copy
     }
 
@@ -167,8 +171,9 @@ final class TranscriptStore {
         // thread — matching how `stop()` offloads the rest of its teardown.
         // `TranscriptDocument` is `Sendable`, so it crosses into the task safely.
         let doc = TranscriptDocument(
-            schemaVersion: 1,
+            schemaVersion: 2,
             sessionID: directory.lastPathComponent,
+            generator: .live,
             utterances: utterances
         )
         let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
@@ -191,7 +196,27 @@ final class TranscriptStore {
 nonisolated struct TranscriptDocument: Codable, Sendable {
     let schemaVersion: Int
     let sessionID: String
+    /// Which pass produced this document. `nil` = schema-v1 live transcript.
+    let generator: Generator?
     let utterances: [Utterance]
+
+    /// Schema v2: live = streaming pipeline at record time; finalize =
+    /// post-stop offline diarization/echo pass over the draft; rerun = full
+    /// from-audio regeneration.
+    nonisolated enum Generator: String, Codable, Sendable {
+        case live
+        case finalize
+        case rerun
+    }
+
+    init(
+        schemaVersion: Int, sessionID: String, generator: Generator?, utterances: [Utterance]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sessionID = sessionID
+        self.generator = generator
+        self.utterances = utterances
+    }
 }
 
 struct DroppedUtterance: Identifiable, Hashable, Sendable {

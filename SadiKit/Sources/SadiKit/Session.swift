@@ -18,6 +18,12 @@ public struct Session: Codable, Sendable {
     public var endedAt: Date?              // nil while in-progress or paused
     public var segments: [Segment]         // 1+ contiguous record-to-pause periods
     public var speakerClusters: [SpeakerCluster]  // accumulated across segments
+    /// True while the post-stop finalize pass (offline diarization + echo
+    /// re-filter) is still owed — set when the recording stops, cleared when
+    /// finalize completes. Survives a quit mid-finalize so the pass can run
+    /// lazily on next launch. `nil` (older sessions / mid-recording) means
+    /// no finalize is pending.
+    public var needsFinalize: Bool?
 
     public init(
         id: String,
@@ -25,7 +31,8 @@ public struct Session: Codable, Sendable {
         startedAt: Date,
         endedAt: Date?,
         segments: [Segment],
-        speakerClusters: [SpeakerCluster]
+        speakerClusters: [SpeakerCluster],
+        needsFinalize: Bool? = nil
     ) {
         self.id = id
         self.title = title
@@ -33,6 +40,7 @@ public struct Session: Codable, Sendable {
         self.endedAt = endedAt
         self.segments = segments
         self.speakerClusters = speakerClusters
+        self.needsFinalize = needsFinalize
     }
 
     /// Atomically write `session.json` into the session directory. Written by
