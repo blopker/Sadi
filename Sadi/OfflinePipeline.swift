@@ -58,6 +58,22 @@ enum OfflinePipeline {
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "offline")
 
+    /// Off-main hop that *forwards cancellation*: `Task.detached` deliberately
+    /// doesn't inherit the awaiting task's cancellation, so without this a
+    /// cancelled pass would keep diarizing/transcribing to completion in the
+    /// background. Used for every interruptible stage; the final save uses a
+    /// plain detached task so a last-instant cancel can't tear the write.
+    nonisolated private static func hop<T: Sendable>(
+        _ body: @escaping @Sendable @concurrent () async throws -> T
+    ) async throws -> T {
+        let task = Task.detached(priority: .userInitiated, operation: body)
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
     // MARK: - Entry point
 
     static func run(
@@ -73,48 +89,51 @@ enum OfflinePipeline {
         else { throw Failure.modelsNotLoaded }
 
         progress("Reading session…")
-        var session = try await Task.detached(priority: .userInitiated) {
+        var session = try await hop {
             try readSession(in: sessionDirectory)
-        }.value
+        }
         guard let segment = session.segments.first else { throw Failure.noSessionMetadata }
 
-        // Offline diarizer models — lazy, may download on first use.
+        // Offline diarizer models — lazy, may download on first use. NOT
+        // routed through `hop`: the load task is shared/memoized, and one
+        // cancelled pass must not abort it for the next.
         progress("Loading offline diarizer…")
         let offlineModels = try await modelHost.loadOfflineDiarizerModels()
+        try Task.checkCancellation()
 
         progress("Decoding audio…")
         let sessionStart = session.startedAt
-        let tracks = try await Task.detached(priority: .userInitiated) {
+        let tracks = try await hop {
             try decodeTracks(segment: segment, sessionStart: sessionStart, directory: sessionDirectory)
-        }.value
+        }
         guard !tracks.isEmpty else { throw Failure.noAudio }
 
         progress("Diarizing…")
-        let diar = try await Task.detached(priority: .userInitiated) {
+        let diar = try await hop {
             try await diarize(tracks: tracks, models: offlineModels)
-        }.value
+        }
 
         // The utterance set: draft from disk (finalize) or from audio (rerun).
         var utterances: [Utterance]
         switch mode {
         case .finalize:
-            utterances = await Task.detached(priority: .userInitiated) {
+            utterances = try await hop {
                 RecordingsStore.loadTranscript(from: sessionDirectory)
-            }.value
+            }
         case .rerun:
             // Manual pins survive a full rerun: carry them over from the old
             // transcript verbatim; freshly transcribed utterances that overlap
             // a pinned one substantially are skipped to avoid duplicates.
-            let pinned = await Task.detached(priority: .userInitiated) {
+            let pinned = try await hop {
                 RecordingsStore.loadTranscript(from: sessionDirectory)
                     .filter { $0.assignmentKind == .manual }
-            }.value
+            }
             progress("Transcribing…")
             // Both tracks at once; each track internally fans its segments
             // out over an ASR worker pool (see `transcribe`).
             let diarSnapshot = diar
             let trackSnapshot = tracks
-            let fresh = try await Task.detached(priority: .userInitiated) {
+            let fresh = try await hop {
                 try await withThrowingTaskGroup(of: [Utterance].self) { group in
                     for track in trackSnapshot {
                         group.addTask {
@@ -127,7 +146,7 @@ enum OfflinePipeline {
                     for try await result in group { all.append(contentsOf: result) }
                     return all
                 }
-            }.value
+            }
             utterances = pinned + fresh.filter { u in
                 !pinned.contains { p in
                     p.source == u.source
@@ -137,15 +156,16 @@ enum OfflinePipeline {
                 }
             }
         }
+        try Task.checkCancellation()
 
         // Tail: clusters → labels → voiceprints → echo. Pure value passes.
         utterances = reassignClusters(utterances, diar: diar, tracks: tracks)
         utterances = relabel(utterances)
 
         progress("Matching voiceprints…")
-        let centroids = await Task.detached(priority: .userInitiated) {
+        let centroids = try await hop {
             clusterCentroids(tracks: tracks, diar: diar, embedder: embedder)
-        }.value
+        }
         var voiceprintHits = 0
         for (key, centroid) in centroids {
             guard let match = voiceprints.match(embedding: centroid) else { continue }
@@ -163,6 +183,9 @@ enum OfflinePipeline {
         let (kept, echoDropped) = echoPass(utterances)
         let final = kept.sorted { $0.startedAt < $1.startedAt }
 
+        // Last interruption point — past here the (atomic) writes go through
+        // unconditionally so a cancel can never leave half-updated files.
+        try Task.checkCancellation()
         progress("Saving…")
         let doc = TranscriptDocument(
             schemaVersion: 2,
@@ -305,6 +328,7 @@ enum OfflinePipeline {
         try await withThrowingTaskGroup(of: (Source, [DiarSegment]).self) { group in
             for track in tracks {
                 group.addTask {
+                    try Task.checkCancellation()
                     let manager = OfflineDiarizerManager()
                     manager.initialize(models: models)
                     let result = try await manager.process(audio: track.samples)
@@ -382,6 +406,9 @@ enum OfflinePipeline {
                     let asr = AsrManager(config: .default, models: asrModels)
                     var results: [(Int, [Utterance])] = []
                     for i in stride(from: w, to: segments.count, by: workers) {
+                        // Cancellation lands within one segment's latency
+                        // (~a second), not at the end of the recording.
+                        try Task.checkCancellation()
                         let utterances = try await transcribeSegment(
                             segments[i], track: track, diar: diar, asr: asr,
                             embedder: embedder)

@@ -329,17 +329,26 @@ private struct RecordingDetailView: View {
         }
         .toolbar {
             ToolbarItem(placement: .automatic) {
-                Button {
-                    jobs.enqueueRerun(directory: item.directory)
-                } label: {
-                    Label("Rerun Transcription", systemImage: "arrow.trianglehead.2.clockwise")
+                if jobBusy {
+                    Button {
+                        jobs.cancel(sessionID: item.session.id)
+                    } label: {
+                        Label("Cancel", systemImage: "xmark.circle")
+                    }
+                    .help("Stop rebuilding this transcript. The current transcript is kept.")
+                } else {
+                    Button {
+                        jobs.enqueueRerun(directory: item.directory)
+                    } label: {
+                        Label("Rerun Transcription", systemImage: "arrow.trianglehead.2.clockwise")
+                    }
+                    .help(
+                        isRecording
+                            ? "Available after the current recording stops."
+                            : "Regenerate this transcript from the recorded audio."
+                    )
+                    .disabled(isRecording || jobs.isRunningModelJob)
                 }
-                .help(
-                    isRecording
-                        ? "Available after the current recording stops."
-                        : "Regenerate this transcript from the recorded audio."
-                )
-                .disabled(isRecording || jobs.isRunningModelJob || jobBusy)
             }
         }
         // Reload when a different recording is shown, or when a job touching

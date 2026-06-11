@@ -50,6 +50,10 @@ final class TranscriptionJobs {
     var isCaptureBusy: @MainActor () -> Bool = { false }
 
     private var queue: [Kind] = []
+    /// The task executing `active` — kept so a user cancel can reach into the
+    /// running pipeline (which checks cancellation between stages and per
+    /// ASR segment).
+    private var runTask: Task<Void, Never>?
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "jobs")
 
@@ -99,6 +103,19 @@ final class TranscriptionJobs {
         pump()
     }
 
+    /// Cancel this session's model job: unqueue it if it hasn't started, or
+    /// cancel the running pipeline if it has (the pass aborts within about a
+    /// second and writes nothing — the existing transcript is untouched).
+    /// A cancelled *finalize* is still owed on disk (`needsFinalize` stays
+    /// set), so it will reappear on the next drain; a cancelled rerun is
+    /// simply gone until requested again.
+    func cancel(sessionID: String) {
+        queue.removeAll { $0.sessionID == sessionID }
+        if active?.kind.sessionID == sessionID {
+            runTask?.cancel()
+        }
+    }
+
     // MARK: - Pump
 
     private func pump() {
@@ -114,9 +131,10 @@ final class TranscriptionJobs {
 
         let kind = queue.remove(at: index)
         active = ActiveJob(kind: kind, phase: "Starting…")
-        Task {
+        runTask = Task {
             await self.run(kind)
             self.active = nil
+            self.runTask = nil
             if let id = kind.sessionID { self.lastCompletedSessionID = id }
             self.pump()
         }
@@ -140,6 +158,10 @@ final class TranscriptionJobs {
                 lastError = nil
                 Self.log.notice(
                     "\(mode.rawValue, privacy: .public) \(dir.lastPathComponent, privacy: .public): \(outcome.utteranceCount) utterances"
+                )
+            } catch is CancellationError {
+                Self.log.notice(
+                    "\(mode.rawValue, privacy: .public) \(dir.lastPathComponent, privacy: .public) cancelled by user"
                 )
             } catch {
                 lastError = String(describing: error)
