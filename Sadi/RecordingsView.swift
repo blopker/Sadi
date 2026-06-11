@@ -282,6 +282,11 @@ private struct RecordingDetailView: View {
     @State private var loaded = false
 
     private var utterances: [Utterance] { document?.utterances ?? [] }
+    /// What the list shows: filler-only rows ("Um.") hidden, presentation
+    /// only — the document keeps them, and pins still resolve by id.
+    private var visibleUtterances: [Utterance] {
+        utterances.filter { !FillerWords.isFillerOnly($0.text) }
+    }
     /// A finalize/rerun for this session is queued or running — lock edits so
     /// a manual pin can't race the transcript rewrite.
     private var jobBusy: Bool { jobs.isBusy(sessionID: item.session.id) }
@@ -298,7 +303,7 @@ private struct RecordingDetailView: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(utterances) { utterance in
+                        ForEach(visibleUtterances) { utterance in
                             SavedUtteranceRow(
                                 utterance: utterance,
                                 voiceprints: voiceprints,

@@ -225,9 +225,8 @@ final class TranscriptionJobs {
             guard var doc = RecordingsStore.loadDocument(from: dir) else { continue }
             var changed = false
             var utterances = doc.utterances
-            for i in utterances.indices {
-                let u = utterances[i]
-                guard u.assignmentKind != .manual, let embedding = u.embedding else { continue }
+
+            func bestMatch(for embedding: [Float]) -> Voiceprint? {
                 var best: (vp: Voiceprint, d: Float)?
                 for vp in prints
                 where vp.modelVersion == ModelHost.embeddingModelVersion
@@ -235,13 +234,36 @@ final class TranscriptionJobs {
                     let d = VoiceprintBook.cosineDistance(embedding, vp.embedding)
                     if d < (best?.d ?? .infinity) { best = (vp, d) }
                 }
-                guard let match = best, match.d < threshold else { continue }
-                let newSpeaker = Speaker.named(match.vp.name, match.vp.id)
-                if u.speaker != newSpeaker || u.assignmentKind != .matched {
-                    utterances[i].speaker = newSpeaker
-                    utterances[i].assignmentKind = .matched
-                    changed = true
-                    totalChanged += 1
+                guard let best, best.d < threshold else { return nil }
+                return best.vp
+            }
+
+            // System rows first, so the mic pass below can apply the
+            // cross-track sanity guard against final system labels.
+            for pass in 0...1 {
+                let source: Source = pass == 0 ? .system : .mic
+                let systemUtterances =
+                    pass == 0 ? [] : utterances.filter { $0.source == .system }
+                for i in utterances.indices where utterances[i].source == source {
+                    let u = utterances[i]
+                    guard u.assignmentKind != .manual, let embedding = u.embedding,
+                          let match = bestMatch(for: embedding)
+                    else { continue }
+                    // A mic row matching a far-end identity without system
+                    // overlap is a mis-match, not bleed — leave it alone
+                    // rather than renaming the local user (SpeakerSanity).
+                    if source == .mic,
+                       SpeakerSanity.isImplausibleMicMatch(
+                           u, voiceprintID: match.id, systemUtterances: systemUtterances) {
+                        continue
+                    }
+                    let newSpeaker = Speaker.named(match.name, match.id)
+                    if u.speaker != newSpeaker || u.assignmentKind != .matched {
+                        utterances[i].speaker = newSpeaker
+                        utterances[i].assignmentKind = .matched
+                        changed = true
+                        totalChanged += 1
+                    }
                 }
             }
             if changed {

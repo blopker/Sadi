@@ -166,13 +166,33 @@ enum OfflinePipeline {
         let centroids = try await hop {
             clusterCentroids(tracks: tracks, diar: diar, embedder: embedder)
         }
+        // Apply matches system-first so the mic pass can ask "is this
+        // identity a far-end speaker?" against final system labels. A mic
+        // utterance matching a far-end print without overlapping system
+        // speech is a mis-match, not bleed — keep its track label instead of
+        // mislabeling the local user as the remote person (SpeakerSanity).
         var voiceprintHits = 0
-        for (key, centroid) in centroids {
-            guard let match = voiceprints.match(embedding: centroid) else { continue }
+        let matches = centroids.compactMapValues { voiceprints.match(embedding: $0) }
+        for (key, match) in matches where key.source == .system {
             for i in utterances.indices
-            where utterances[i].source == key.source
+            where utterances[i].source == .system
                 && utterances[i].diarCluster == key.cluster
                 && utterances[i].assignmentKind != .manual {
+                utterances[i].speaker = .named(match.voiceprint.name, match.voiceprint.id)
+                utterances[i].assignmentKind = .matched
+                voiceprintHits += 1
+            }
+        }
+        let systemUtterances = utterances.filter { $0.source == .system }
+        for (key, match) in matches where key.source == .mic {
+            for i in utterances.indices
+            where utterances[i].source == .mic
+                && utterances[i].diarCluster == key.cluster
+                && utterances[i].assignmentKind != .manual {
+                guard !SpeakerSanity.isImplausibleMicMatch(
+                    utterances[i], voiceprintID: match.voiceprint.id,
+                    systemUtterances: systemUtterances)
+                else { continue }
                 utterances[i].speaker = .named(match.voiceprint.name, match.voiceprint.id)
                 utterances[i].assignmentKind = .matched
                 voiceprintHits += 1

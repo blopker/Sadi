@@ -134,7 +134,12 @@ private struct TranscriptList: View {
     let onName: (Utterance, String) -> Void
 
     private var rows: [Row] {
-        let kept = utterances.map { Row.kept($0) }
+        // Hide rows that are nothing but hesitation sounds ("Um.").
+        // Presentation-only: the store and the persisted transcript keep
+        // them (and the "show dropped" debug view is left unfiltered).
+        let kept = utterances
+            .filter { !FillerWords.isFillerOnly($0.text) }
+            .map { Row.kept($0) }
         let droppedRows = dropped.map { Row.dropped($0) }
         return (kept + droppedRows).sorted { $0.startedAt < $1.startedAt }
     }

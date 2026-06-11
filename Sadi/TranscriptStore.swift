@@ -111,11 +111,23 @@ final class TranscriptStore {
     /// replace the speaker label with `.named` and stamp `matched` provenance.
     /// `manual` utterances are never touched — that's the user's pin, and the
     /// AssignmentKind contract says only the user may move it.
+    ///
+    /// Cross-track sanity: a mic utterance matching a *far-end* speaker's
+    /// print is either bleed (it overlaps system speech — the echo filter's
+    /// problem) or a mis-match (the speakers were silent, so the audio can't
+    /// be the remote person — keep `.you` rather than mislabeling the local
+    /// user). See `SpeakerSanity`.
     private func resolveVoiceprint(_ u: Utterance) -> Utterance {
         guard u.assignmentKind != .manual,
               let embedding = u.embedding,
               let match = voiceprints.match(embedding: embedding)
         else { return u }
+        if SpeakerSanity.isImplausibleMicMatch(
+            u, voiceprintID: match.voiceprint.id,
+            systemUtterances: utterances.filter { $0.source == .system }
+        ) {
+            return u
+        }
         var copy = u
         copy.speaker = .named(match.voiceprint.name, match.voiceprint.id)
         copy.assignmentKind = .matched
