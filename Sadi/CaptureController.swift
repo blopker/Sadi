@@ -44,6 +44,12 @@ final class CaptureController {
     private var startTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
 
+    /// Fired after a stop has fully persisted the session (MP4s, transcript,
+    /// metadata). The app wires this to the finalize queue. On a quit-stop the
+    /// queued work simply doesn't finish — `needsFinalize` survives on disk
+    /// and the next launch drains it.
+    var onStopped: (@MainActor () -> Void)?
+
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "capture")
 
     init(modelHost: ModelHost, transcript: TranscriptStore) {
@@ -367,5 +373,6 @@ final class CaptureController {
         systemStatus = "idle"
         phase = .idle
         stopTask = nil
+        onStopped?()
     }
 }

@@ -11,6 +11,7 @@ struct RootView: View {
     let transcript: TranscriptStore
     let voiceprints: VoiceprintBook
     let controller: CaptureController
+    let jobs: TranscriptionJobs
 
     @State private var selection: SidebarItem = .recordings
     // The Recordings tab's nav path lives here so the app-wide record button
@@ -63,6 +64,7 @@ struct RootView: View {
                 transcript: transcript,
                 voiceprints: voiceprints,
                 controller: controller,
+                jobs: jobs,
                 canStart: canStart,
                 path: $recordingsPath
             )

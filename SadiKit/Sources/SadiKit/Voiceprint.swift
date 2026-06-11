@@ -165,7 +165,9 @@ public final class VoiceprintBook {
 
     /// Cosine distance over two equal-length [Float] vectors.
     /// `0` = identical direction, `1` = orthogonal, `2` = opposite.
-    public static func cosineDistance(_ a: [Float], _ b: [Float]) -> Float {
+    /// Pure math — `nonisolated` so off-main passes (re-attribution sweeps)
+    /// can score embeddings without hopping to the main actor.
+    public nonisolated static func cosineDistance(_ a: [Float], _ b: [Float]) -> Float {
         precondition(a.count == b.count)
         var dot: Float = 0, na: Float = 0, nb: Float = 0
         for i in 0..<a.count {

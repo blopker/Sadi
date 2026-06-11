@@ -7,6 +7,7 @@ struct ContentView: View {
     let transcript: TranscriptStore
     let voiceprints: VoiceprintBook
     let controller: CaptureController
+    let jobs: TranscriptionJobs
 
     @State private var micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
     @State private var showDropped = false
@@ -26,6 +27,9 @@ struct ContentView: View {
                         guard let embedding = utterance.embedding else { return }
                         _ = try? voiceprints.enroll(name: name, embedding: embedding)
                         transcript.rerunVoiceprintMatching()
+                        // Spread the new name to saved recordings too (cheap
+                        // JSON sweep, runs even while recording).
+                        jobs.enqueueReattribution()
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

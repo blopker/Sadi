@@ -43,13 +43,28 @@ final class RecordingsStore {
     /// Decode a finalized recording's `transcript.json` into utterances.
     /// `nonisolated` so callers can (and should) run it off the main actor.
     nonisolated static func loadTranscript(from directory: URL) -> [Utterance] {
+        loadDocument(from: directory)?.utterances ?? []
+    }
+
+    /// Full-document load — for callers that rewrite the transcript (manual
+    /// speaker pinning, re-attribution) and must preserve the generator tag.
+    nonisolated static func loadDocument(from directory: URL) -> TranscriptDocument? {
         let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let data = try? Data(contentsOf: url),
-              let doc = try? decoder.decode(TranscriptDocument.self, from: data)
-        else { return [] }
-        return doc.utterances
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(TranscriptDocument.self, from: data)
+    }
+
+    /// Atomic transcript rewrite, same encoder settings as the live store's
+    /// `writeTranscript`.
+    nonisolated static func saveDocument(_ doc: TranscriptDocument, to directory: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(doc)
+        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
+        try data.write(to: url, options: .atomic)
     }
 }
 
@@ -79,6 +94,7 @@ struct RecordingsView: View {
     let transcript: TranscriptStore
     let voiceprints: VoiceprintBook
     let controller: CaptureController
+    let jobs: TranscriptionJobs
     let canStart: Bool
     @Binding var path: [RecordingsRoute]
 
@@ -124,13 +140,19 @@ struct RecordingsView: View {
                         modelHost: modelHost,
                         transcript: transcript,
                         voiceprints: voiceprints,
-                        controller: controller
+                        controller: controller,
+                        jobs: jobs
                     )
                     .navigationTitle("Recording")
                     .toolbar { ToolbarItem(placement: .primaryAction) { recordButton } }
                 case .detail(let item):
-                    RecordingDetailView(item: item)
-                        .toolbar { ToolbarItem(placement: .primaryAction) { recordButton } }
+                    RecordingDetailView(
+                        item: item,
+                        voiceprints: voiceprints,
+                        jobs: jobs,
+                        isRecording: controller.isRunning
+                    )
+                    .toolbar { ToolbarItem(placement: .primaryAction) { recordButton } }
                 }
             }
         }
@@ -238,9 +260,17 @@ struct RecordingRow: View {
 
 private struct RecordingDetailView: View {
     let item: RecordingItem
+    let voiceprints: VoiceprintBook
+    let jobs: TranscriptionJobs
+    let isRecording: Bool
 
-    @State private var utterances: [Utterance] = []
+    @State private var document: TranscriptDocument?
     @State private var loaded = false
+
+    private var utterances: [Utterance] { document?.utterances ?? [] }
+    /// A finalize/rerun for this session is queued or running — lock edits so
+    /// a manual pin can't race the transcript rewrite.
+    private var jobBusy: Bool { jobs.isBusy(sessionID: item.session.id) }
 
     var body: some View {
         Group {
@@ -248,13 +278,20 @@ private struct RecordingDetailView: View {
                 ContentUnavailableView(
                     "No transcript",
                     systemImage: "text.bubble",
-                    description: Text("This recording has no saved transcript. The audio is still on disk.")
+                    description: Text(
+                        "This recording has no saved transcript. The audio is still on disk — use Rerun Transcription to regenerate it.")
                 )
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(utterances) { utterance in
-                            SavedUtteranceRow(utterance: utterance)
+                            SavedUtteranceRow(
+                                utterance: utterance,
+                                voiceprints: voiceprints,
+                                locked: jobBusy,
+                                onAssign: { speaker in pin(utterance, to: speaker) },
+                                onEnroll: { name in enroll(name: name, from: utterance) }
+                            )
                         }
                     }
                     .padding(16)
@@ -262,10 +299,41 @@ private struct RecordingDetailView: View {
             }
         }
         .navigationTitle(title)
-        .task(id: item.id) {
+        .safeAreaInset(edge: .top) {
+            if let active = jobs.active, active.kind.sessionID == item.session.id {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(bannerLabel(for: active))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.bar)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    jobs.enqueueRerun(directory: item.directory)
+                } label: {
+                    Label("Rerun Transcription", systemImage: "arrow.trianglehead.2.clockwise")
+                }
+                .help(
+                    isRecording
+                        ? "Available after the current recording stops."
+                        : "Regenerate this transcript from the recorded audio."
+                )
+                .disabled(isRecording || jobs.isRunningModelJob || jobBusy)
+            }
+        }
+        // Reload when a different recording is shown, or when a job touching
+        // this (or any — re-attribution uses "*") session finishes.
+        .task(id: "\(item.id)|\(jobs.lastCompletedSessionID ?? "")") {
             let directory = item.directory
-            utterances = await Task.detached(priority: .userInitiated) {
-                RecordingsStore.loadTranscript(from: directory)
+            document = await Task.detached(priority: .userInitiated) {
+                RecordingsStore.loadDocument(from: directory)
             }.value
             loaded = true
         }
@@ -276,18 +344,89 @@ private struct RecordingDetailView: View {
             ? item.session.startedAt.formatted(date: .abbreviated, time: .shortened)
             : item.session.title
     }
+
+    private func bannerLabel(for job: TranscriptionJobs.ActiveJob) -> String {
+        switch job.kind {
+        case .finalize: "Finalizing — \(job.phase)"
+        case .rerun: "Rerunning transcription — \(job.phase)"
+        case .reattribute: "Updating speaker names…"
+        }
+    }
+
+    /// Manual pin: the user said "this utterance is this speaker". Writes
+    /// `.manual` provenance, which every automated pass must leave alone.
+    private func pin(_ utterance: Utterance, to speaker: SadiKit.Speaker) {
+        guard let doc = document, !jobBusy else { return }
+        var updated = doc.utterances
+        guard let idx = updated.firstIndex(where: { $0.id == utterance.id }) else { return }
+        updated[idx].speaker = speaker
+        updated[idx].assignmentKind = .manual
+        let newDoc = TranscriptDocument(
+            schemaVersion: 2,
+            sessionID: doc.sessionID,
+            generator: doc.generator,
+            utterances: updated
+        )
+        document = newDoc
+        let directory = item.directory
+        Task.detached(priority: .userInitiated) {
+            do {
+                try RecordingsStore.saveDocument(newDoc, to: directory)
+            } catch {
+                // Disk write failed; the in-memory pin still shows. The next
+                // successful rewrite (another pin, a job) will retry the file.
+            }
+        }
+    }
+
+    /// Enroll a brand-new speaker from this utterance's embedding, pin the
+    /// utterance manually, and sweep the name across saved recordings.
+    private func enroll(name: String, from utterance: Utterance) {
+        guard let embedding = utterance.embedding else { return }
+        guard let id = try? voiceprints.enroll(name: name, embedding: embedding) else { return }
+        pin(utterance, to: .named(name, id))
+        jobs.enqueueReattribution()
+    }
 }
 
-/// Read-only utterance row for saved transcripts (no speaker-naming popover).
+/// Utterance row for saved transcripts. The speaker label opens an assignment
+/// popover (pick an enrolled speaker, or enroll a new one from this
+/// utterance's embedding); a pin marks manual assignments.
 private struct SavedUtteranceRow: View {
     let utterance: Utterance
+    let voiceprints: VoiceprintBook
+    let locked: Bool
+    let onAssign: (SadiKit.Speaker) -> Void
+    let onEnroll: (String) -> Void
+
+    @State private var showingAssignPopover = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(speakerLabel)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(speakerColor)
+            Button(action: { showingAssignPopover = true }) {
+                HStack(spacing: 3) {
+                    if utterance.assignmentKind == .manual {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(speakerLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(speakerColor)
+                }
                 .frame(width: 80, alignment: .trailing)
+            }
+            .buttonStyle(.plain)
+            .disabled(locked)
+            .help(locked ? "Editing is locked while this transcript is being rebuilt." : "Click to assign this line to a speaker")
+            .popover(isPresented: $showingAssignPopover) {
+                AssignSpeakerPopover(
+                    utterance: utterance,
+                    voiceprints: voiceprints,
+                    onAssign: onAssign,
+                    onEnroll: onEnroll
+                )
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(utterance.text)
                     .font(.body)
@@ -314,5 +453,81 @@ private struct SavedUtteranceRow: View {
         case .mic: .blue
         case .system: .orange
         }
+    }
+}
+
+/// Saved-transcript counterpart of the live screen's NameSpeakerPopover.
+/// Assigning an existing speaker is a pure manual pin (no enrollment — the
+/// voiceprint already exists); a new name enrolls from this utterance's
+/// embedding first.
+private struct AssignSpeakerPopover: View {
+    let utterance: Utterance
+    let voiceprints: VoiceprintBook
+    let onAssign: (SadiKit.Speaker) -> Void
+    let onEnroll: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Assign speaker")
+                .font(.headline)
+
+            if !voiceprints.prints.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(voiceprints.prints.sorted(by: {
+                            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                        })) { vp in
+                            Button {
+                                onAssign(.named(vp.name, vp.id))
+                                dismiss()
+                            } label: {
+                                Label(vp.name, systemImage: "person.crop.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(maxHeight: 120)
+                Divider()
+            }
+
+            Text("Or enroll a new speaker from this line:")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("Name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(submit)
+                .disabled(utterance.embedding == nil)
+            if utterance.embedding == nil {
+                Text("This line has no voice embedding; pick an existing speaker instead.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.escape)
+                Button("Enroll & Assign") { submit() }
+                    .keyboardShortcut(.return)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        name.trimmingCharacters(in: .whitespaces).isEmpty
+                            || utterance.embedding == nil)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    private func submit() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, utterance.embedding != nil else { return }
+        onEnroll(trimmed)
+        dismiss()
     }
 }

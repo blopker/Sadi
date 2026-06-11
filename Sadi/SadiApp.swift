@@ -75,6 +75,7 @@ struct SadiApp: App {
     @State private var voiceprints: VoiceprintBook
     @State private var transcript: TranscriptStore
     @State private var controller: CaptureController
+    @State private var jobs: TranscriptionJobs
 
     init() {
         let host = ModelHost()
@@ -84,10 +85,19 @@ struct SadiApp: App {
             modelVersion: ModelHost.embeddingModelVersion
         )
         let store = TranscriptStore(voiceprints: book)
+        let controller = CaptureController(modelHost: host, transcript: store)
+        let jobs = TranscriptionJobs(modelHost: host, voiceprints: book)
+        // Model jobs defer while recording (ANE contention) and the finalize
+        // pass for a just-stopped session is picked up from its on-disk
+        // needsFinalize flag. Both objects live for the app's lifetime, so
+        // the mutual capture is intentional.
+        jobs.isCaptureBusy = { controller.isRunning }
+        controller.onStopped = { Task { await jobs.drainPendingFromDisk() } }
         _modelHost = State(initialValue: host)
         _voiceprints = State(initialValue: book)
         _transcript = State(initialValue: store)
-        _controller = State(initialValue: CaptureController(modelHost: host, transcript: store))
+        _controller = State(initialValue: controller)
+        _jobs = State(initialValue: jobs)
     }
 
     var body: some Scene {
@@ -96,7 +106,8 @@ struct SadiApp: App {
                 modelHost: modelHost,
                 transcript: transcript,
                 voiceprints: voiceprints,
-                controller: controller
+                controller: controller,
+                jobs: jobs
             )
             .frame(minWidth: 900, minHeight: 520)
             .task {
@@ -107,6 +118,9 @@ struct SadiApp: App {
                     RecordingNotifier.requestAuthorization()
                 }
                 await modelHost.loadIfNeeded()
+                // Sessions still owing their finalize pass (quit mid-pass, or
+                // recorded before the app gained one) get it now.
+                await jobs.drainPendingFromDisk()
             }
         }
         .windowResizability(.contentSize)
