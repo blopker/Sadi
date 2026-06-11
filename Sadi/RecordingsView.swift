@@ -302,14 +302,16 @@ private struct RecordingDetailView: View {
                 )
             } else {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(visibleUtterances) { utterance in
-                            SavedUtteranceRow(
-                                utterance: utterance,
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(TranscriptBlock.group(visibleUtterances)) { block in
+                            TranscriptBlockView(
+                                block: block,
                                 voiceprints: voiceprints,
                                 locked: jobBusy,
-                                onAssign: { speaker in pin(utterance, to: speaker) },
-                                onEnroll: { name in enroll(name: name, from: utterance) }
+                                onAssign: { ids, speaker in pin(ids, to: speaker) },
+                                onEnroll: { name, representative, ids in
+                                    enroll(name: name, from: representative, ids: ids)
+                                }
                             )
                         }
                     }
@@ -381,14 +383,20 @@ private struct RecordingDetailView: View {
         }
     }
 
-    /// Manual pin: the user said "this utterance is this speaker". Writes
-    /// `.manual` provenance, which every automated pass must leave alone.
-    private func pin(_ utterance: Utterance, to speaker: SadiKit.Speaker) {
-        guard let doc = document, !jobBusy else { return }
+    /// Manual pin: the user said "these utterances are this speaker" — one
+    /// segment (click on its text) or a whole coalesced block (click on the
+    /// label). Writes `.manual` provenance, which every automated pass must
+    /// leave alone; one atomic persist for the whole group.
+    private func pin(_ ids: Set<UUID>, to speaker: SadiKit.Speaker) {
+        guard let doc = document, !jobBusy, !ids.isEmpty else { return }
         var updated = doc.utterances
-        guard let idx = updated.firstIndex(where: { $0.id == utterance.id }) else { return }
-        updated[idx].speaker = speaker
-        updated[idx].assignmentKind = .manual
+        var any = false
+        for idx in updated.indices where ids.contains(updated[idx].id) {
+            updated[idx].speaker = speaker
+            updated[idx].assignmentKind = .manual
+            any = true
+        }
+        guard any else { return }
         let newDoc = TranscriptDocument(
             schemaVersion: 2,
             sessionID: doc.sessionID,
@@ -407,67 +415,161 @@ private struct RecordingDetailView: View {
         }
     }
 
-    /// Enroll a brand-new speaker from this utterance's embedding, pin the
-    /// utterance manually, and sweep the name across saved recordings.
-    private func enroll(name: String, from utterance: Utterance) {
-        guard let embedding = utterance.embedding else { return }
+    /// Enroll a brand-new speaker from a representative utterance's
+    /// embedding, pin the given utterances manually, and sweep the name
+    /// across saved recordings.
+    private func enroll(name: String, from representative: Utterance, ids: Set<UUID>) {
+        guard let embedding = representative.embedding else { return }
         guard let id = try? voiceprints.enroll(name: name, embedding: embedding) else { return }
-        pin(utterance, to: .named(name, id))
+        pin(ids, to: .named(name, id))
         jobs.enqueueReattribution()
     }
 }
 
-/// Utterance row for saved transcripts. The speaker label opens an assignment
-/// popover (pick an enrolled speaker, or enroll a new one from this
-/// utterance's embedding); a pin marks manual assignments.
-private struct SavedUtteranceRow: View {
-    let utterance: Utterance
+// MARK: - Coalesced transcript blocks
+
+/// A consecutive run of same-speaker utterances, presented as one block with
+/// a single label. Presentation-only — the document keeps every utterance, so
+/// per-segment reclassification (and every later pass) still works on ids.
+/// Within a block, a pause of `paragraphGap` or more starts a new paragraph,
+/// so a long monologue reads as paragraphs without repeating the label.
+private struct TranscriptBlock: Identifiable {
+    let id: UUID  // first utterance's id — stable across re-renders
+    let source: Source
+    let speaker: SadiKit.Speaker
+    let anyManual: Bool
+    let startedAt: Date
+    let paragraphs: [[Utterance]]
+
+    var utteranceIDs: Set<UUID> { Set(paragraphs.flatMap { $0.map(\.id) }) }
+    var count: Int { paragraphs.reduce(0) { $0 + $1.count } }
+
+    /// Best utterance to enroll a new voiceprint from: prefer an embedding
+    /// computed over the segment's own audio (not the ambiguous fallback).
+    var enrollRepresentative: Utterance? {
+        let all = paragraphs.flatMap { $0 }
+        return all.first { $0.embedding != nil && $0.embeddingAmbiguous != true }
+            ?? all.first { $0.embedding != nil }
+    }
+
+    static func group(
+        _ utterances: [Utterance], paragraphGap: TimeInterval = 3
+    ) -> [TranscriptBlock] {
+        var blocks: [TranscriptBlock] = []
+        var current: [Utterance] = []
+
+        func flush() {
+            guard let first = current.first else { return }
+            var paragraphs: [[Utterance]] = []
+            var paragraph: [Utterance] = []
+            var previousEnd: Date?
+            for u in current {
+                if let previousEnd, !paragraph.isEmpty,
+                    u.startedAt.timeIntervalSince(previousEnd) >= paragraphGap {
+                    paragraphs.append(paragraph)
+                    paragraph = []
+                }
+                paragraph.append(u)
+                previousEnd = u.endedAt
+            }
+            if !paragraph.isEmpty { paragraphs.append(paragraph) }
+            blocks.append(
+                TranscriptBlock(
+                    id: first.id,
+                    source: first.source,
+                    speaker: first.speaker,
+                    anyManual: current.contains { $0.assignmentKind == .manual },
+                    startedAt: first.startedAt,
+                    paragraphs: paragraphs
+                ))
+            current = []
+        }
+
+        for u in utterances {
+            if let last = current.last, last.source == u.source, last.speaker == u.speaker {
+                current.append(u)
+            } else {
+                flush()
+                current = [u]
+            }
+        }
+        flush()
+        return blocks
+    }
+}
+
+/// One coalesced block: the label column (click = reassign the whole group)
+/// next to flowing paragraphs of segment chips (hover = highlight one
+/// segment's extent, click = reassign just that segment).
+private struct TranscriptBlockView: View {
+    let block: TranscriptBlock
     let voiceprints: VoiceprintBook
     let locked: Bool
-    let onAssign: (SadiKit.Speaker) -> Void
-    let onEnroll: (String) -> Void
+    let onAssign: (Set<UUID>, SadiKit.Speaker) -> Void
+    let onEnroll: (String, Utterance, Set<UUID>) -> Void
 
-    @State private var showingAssignPopover = false
+    @State private var showingGroupPopover = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Button(action: { showingAssignPopover = true }) {
-                HStack(spacing: 3) {
-                    if utterance.assignmentKind == .manual {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.tertiary)
+            VStack(alignment: .trailing, spacing: 2) {
+                Button(action: { showingGroupPopover = true }) {
+                    HStack(spacing: 3) {
+                        if block.anyManual {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(speakerLabel)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(speakerColor)
                     }
-                    Text(speakerLabel)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(speakerColor)
                 }
-                .frame(width: 80, alignment: .trailing)
-            }
-            .buttonStyle(.plain)
-            .disabled(locked)
-            .help(locked ? "Editing is locked while this transcript is being rebuilt." : "Click to assign this line to a speaker")
-            .popover(isPresented: $showingAssignPopover) {
-                AssignSpeakerPopover(
-                    utterance: utterance,
-                    voiceprints: voiceprints,
-                    onAssign: onAssign,
-                    onEnroll: onEnroll
+                .buttonStyle(.plain)
+                .disabled(locked)
+                .help(
+                    locked
+                        ? "Editing is locked while this transcript is being rebuilt."
+                        : "Click to assign all \(block.count) segment\(block.count == 1 ? "" : "s") in this group"
                 )
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(utterance.text)
-                    .font(.body)
-                    .textSelection(.enabled)
-                Text(utterance.startedAt.formatted(date: .omitted, time: .standard))
+                .popover(isPresented: $showingGroupPopover) {
+                    if let representative = block.enrollRepresentative ?? block.paragraphs.first?.first {
+                        AssignSpeakerPopover(
+                            utterance: representative,
+                            voiceprints: voiceprints,
+                            scope: block.count > 1 ? "Applies to all \(block.count) segments in this group." : nil,
+                            onAssign: { onAssign(block.utteranceIDs, $0) },
+                            onEnroll: { onEnroll($0, representative, block.utteranceIDs) }
+                        )
+                    }
+                }
+                Text(block.startedAt.formatted(date: .omitted, time: .standard))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
+            .frame(width: 80, alignment: .trailing)
+
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(block.paragraphs.enumerated()), id: \.offset) { _, paragraph in
+                    SegmentFlow(spacing: 3) {
+                        ForEach(paragraph) { segment in
+                            SegmentChip(
+                                utterance: segment,
+                                voiceprints: voiceprints,
+                                locked: locked,
+                                onAssign: { onAssign([segment.id], $0) },
+                                onEnroll: { onEnroll($0, segment, [segment.id]) }
+                            )
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     private var speakerLabel: String {
-        switch utterance.speaker {
+        switch block.speaker {
         case .you: "You"
         case .them: "Them"
         case .remote(let n): "Remote \(n)"
@@ -477,9 +579,133 @@ private struct SavedUtteranceRow: View {
     }
 
     private var speakerColor: Color {
-        switch utterance.source {
+        switch block.source {
         case .mic: .blue
         case .system: .orange
+        }
+    }
+}
+
+/// One segment inside a block: plain body text that flows with its siblings,
+/// but reveals its own extent on hover and reassigns on click.
+private struct SegmentChip: View {
+    let utterance: Utterance
+    let voiceprints: VoiceprintBook
+    let locked: Bool
+    let onAssign: (SadiKit.Speaker) -> Void
+    let onEnroll: (String) -> Void
+
+    @State private var hovered = false
+    @State private var showingPopover = false
+
+    var body: some View {
+        Text(utterance.text)
+            .font(.body)
+            .textSelection(.enabled)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 1)
+            .background(
+                hovered && !locked ? Color.accentColor.opacity(0.14) : .clear,
+                in: RoundedRectangle(cornerRadius: 4)
+            )
+            .onHover { hovered = $0 }
+            .onTapGesture {
+                if !locked { showingPopover = true }
+            }
+            .help(
+                "\(utterance.startedAt.formatted(date: .omitted, time: .standard))"
+                    + (locked ? "" : " — click to reassign this segment")
+            )
+            .popover(isPresented: $showingPopover) {
+                AssignSpeakerPopover(
+                    utterance: utterance,
+                    voiceprints: voiceprints,
+                    scope: "Applies to this segment only.",
+                    onAssign: onAssign,
+                    onEnroll: onEnroll
+                )
+            }
+    }
+}
+
+/// Canvas check for the coalescing layout: short fragments flowing into one
+/// line, a paragraph break after a >3 s pause, and a second speaker block.
+#Preview("Coalesced blocks") {
+    let base = Date()
+    func u(_ text: String, _ start: TimeInterval, _ end: TimeInterval, source: Source = .mic, speaker: SadiKit.Speaker = .you) -> Utterance {
+        Utterance(
+            source: source, speaker: speaker, text: text,
+            startedAt: base.addingTimeInterval(start), endedAt: base.addingTimeInterval(end))
+    }
+    let utterances = [
+        u("So I was thinking", 0, 1.2),
+        u("maybe we should", 1.8, 2.6),
+        u("try the other approach first.", 3.0, 4.8),
+        u("Because honestly the current one has been flaky for weeks and nobody really understands why it breaks.", 9, 16),
+        u("Yeah, that makes sense to me.", 17, 19, source: .system, speaker: .named("Vanessa", UUID())),
+        u("Okay, I'll write it up.", 20, 22),
+    ]
+    let book = VoiceprintBook(
+        storeURL: FileManager.default.temporaryDirectory.appending(path: "preview-book.json"),
+        modelVersion: "preview")
+    return ScrollView {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            ForEach(TranscriptBlock.group(utterances)) { block in
+                TranscriptBlockView(
+                    block: block, voiceprints: book, locked: false,
+                    onAssign: { _, _ in }, onEnroll: { _, _, _ in }
+                )
+            }
+        }
+        .padding(16)
+    }
+    .frame(width: 560, height: 320)
+}
+
+/// Minimal flow layout: lays subviews left-to-right, wrapping at the
+/// container edge. Each subview is proposed the full container width, so a
+/// short segment flows inline while a long one wraps internally and takes
+/// its own rows — paragraphs read as prose, not as a list.
+private struct SegmentFlow: Layout {
+    var spacing: CGFloat = 3
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
+            if x > 0, x + size.width > width {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: width.isFinite ? width : x, height: y + rowHeight)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+            if x > bounds.minX, x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(
+                at: CGPoint(x: x, y: y),
+                proposal: ProposedViewSize(width: min(size.width, bounds.width), height: size.height)
+            )
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
         }
     }
 }
@@ -491,6 +717,9 @@ private struct SavedUtteranceRow: View {
 private struct AssignSpeakerPopover: View {
     let utterance: Utterance
     let voiceprints: VoiceprintBook
+    /// Optional scope note ("Applies to all 5 segments in this group.") so a
+    /// group assign and a single-segment assign are distinguishable.
+    var scope: String?
     let onAssign: (SadiKit.Speaker) -> Void
     let onEnroll: (String) -> Void
 
@@ -501,6 +730,11 @@ private struct AssignSpeakerPopover: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Assign speaker")
                 .font(.headline)
+            if let scope {
+                Text(scope)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             if !voiceprints.prints.isEmpty {
                 ScrollView {
