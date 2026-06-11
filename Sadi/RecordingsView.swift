@@ -46,6 +46,20 @@ final class RecordingsStore {
         loadDocument(from: directory)?.utterances ?? []
     }
 
+    /// Build the `RecordingItem` for a single session directory — used to
+    /// deep-link straight to a recording (e.g. the one that just stopped)
+    /// without waiting for a full list rescan. `nil` until/unless its
+    /// `session.json` is on disk.
+    nonisolated static func loadItem(from directory: URL) -> RecordingItem? {
+        let url = directory.appending(path: "session.json", directoryHint: .notDirectory)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: url),
+              let session = try? decoder.decode(Session.self, from: data)
+        else { return nil }
+        return RecordingItem(session: session, directory: directory)
+    }
+
     /// Full-document load — for callers that rewrite the transcript (manual
     /// speaker pinning, re-attribution) and must preserve the generator tag.
     nonisolated static func loadDocument(from directory: URL) -> TranscriptDocument? {

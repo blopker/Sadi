@@ -50,8 +50,27 @@ struct RootView: View {
             }
         }
         .onChange(of: controller.isRunning) { _, isRunning in
-            // When a recording stops from any tab, pop the live screen.
-            if !isRunning { recordingsPath.removeAll() }
+            // When a recording stops, swap the live screen for the finished
+            // recording's detail screen (where the finalize banner shows). A
+            // session that never persisted metadata (no pipeline came up)
+            // has no detail to show — fall back to the list.
+            guard !isRunning else { return }
+            let directoryPath = controller.sessionDirectoryPath
+            guard !directoryPath.isEmpty else {
+                recordingsPath.removeAll()
+                return
+            }
+            Task {
+                let directory = URL(fileURLWithPath: directoryPath, isDirectory: true)
+                let item = await Task.detached(priority: .userInitiated) {
+                    RecordingsStore.loadItem(from: directory)
+                }.value
+                if let item {
+                    recordingsPath = [.detail(item)]
+                } else {
+                    recordingsPath.removeAll()
+                }
+            }
         }
     }
 
