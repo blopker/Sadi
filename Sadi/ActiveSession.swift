@@ -63,8 +63,9 @@ private nonisolated final class InferenceBacklog: Sendable {
 /// it falls more than `inferenceCapSeconds` behind, transcription audio is
 /// dropped (logged, replaced by a gap so timestamps stay sample-accurate)
 /// while the archive is unaffected. Lost *archive* audio — ring overflow or
-/// writer backpressure, i.e. the disk can't keep up — is accounted as a
-/// timeline gap and, past `stallThresholdSeconds`, reported via `onStall`.
+/// writer backpressure, i.e. the disk can't keep up — is backfilled as
+/// encoded silence (keeping the file wall-clock true) and, past
+/// `stallThresholdSeconds`, reported via `onStall`.
 @MainActor
 final class StreamPipeline {
     let source: Source
@@ -191,17 +192,17 @@ final class StreamPipeline {
                 feed.yield(.samples(chunk))
             }
 
-            // Account ring-overflow losses: advance the MP4 timeline past the
-            // hole and owe the inference side an equal gap. The position is
-            // approximate (the ring buffers ~10 s ahead of detection), which
-            // is acceptable because the failsafe stops the recording within
-            // ~1 s of loss anyway.
+            // Account ring-overflow losses: the archive stands in encoded
+            // silence for the hole and the inference side is owed an equal
+            // gap. The position is approximate (the ring buffers ~10 s ahead
+            // of detection), which is acceptable because the failsafe stops
+            // the recording within ~1 s of loss anyway.
             func accountRingDrops() {
                 let dropsNow = capture.droppedFrames
                 guard dropsNow > ringDropsSeen else { return }
                 let delta = Int(dropsNow - ringDropsSeen)
                 ringDropsSeen = dropsNow
-                writer.skip(frames: delta)
+                writer.insertSilence(frames: delta)
                 pendingGapFrames += delta
                 Self.log.error(
                     "\(label, privacy: .public): ring overflow — lost \(Double(delta) / capture.sampleRate, format: .fixed(precision: 2))s of audio"

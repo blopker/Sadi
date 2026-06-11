@@ -30,10 +30,23 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
     private let nanosPerFrame: Double
     private static let nanosecondTimescale: CMTimeScale = 1_000_000_000
     /// Source frames *presented* to the writer — appended or dropped. PTS
-    /// derives from this count, so a dropped chunk leaves a real gap in the
-    /// MP4 timeline instead of silently compressing it: playback positions
-    /// stay wall-clock aligned with the transcript even across drops.
+    /// derives from this count.
+    ///
+    /// NOTE: a PTS jump alone does NOT survive the AAC encode — AVAssetWriter's
+    /// audio path treats input PCM as a continuous stream and regenerates
+    /// timestamps, flattening any gap (verified empirically: a 12 s skip reads
+    /// back as a seamless file). Wall-clock honesty across losses is instead
+    /// kept by `silenceOwed`: every lost frame is eventually *encoded* as
+    /// silence, so playback positions stay aligned with the transcript.
     private var sourceFrames: Int64 = 0
+    /// Frames of silence owed to the timeline: capture-side losses reported
+    /// via `insertSilence(frames:)` plus chunks dropped under encoder
+    /// backpressure. Paid down with zero-filled appends as soon as the input
+    /// is ready again.
+    private var silenceOwed = 0
+    /// Zero-fill appends are chunked so a large debt (bounded ~1 s by the
+    /// stall failsafe anyway) never builds one huge sample buffer.
+    private static let silenceChunkFrames = 16_384
     /// Frames dropped because the encoder/disk fell behind
     /// (`isReadyForMoreMediaData` false) or the writer latched `.failed`.
     /// Read by the archive loop's stall failsafe; same-thread as `append`.
@@ -133,13 +146,32 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         }
 
         // Backpressure: encoder typically keeps up. If it falls behind we
-        // drop — but still advance `sourceFrames`, so the loss shows up as a
-        // PTS gap (timeline preserved) and in `droppedFrames` (failsafe).
+        // drop the chunk — counted for the stall failsafe — and owe the
+        // timeline an equal run of silence so wall-clock alignment survives.
         guard input.isReadyForMoreMediaData else {
             droppedFrames += Int64(nFrames)
             sourceFrames += Int64(nFrames)
+            silenceOwed += nFrames
             return
         }
+
+        // Lost frames sit *before* this chunk in time, so settle the silence
+        // debt first to keep the encoded stream in timeline order. Settling
+        // may consume the encoder's appetite — re-check before the real chunk.
+        try settleSilenceDebt()
+        guard input.isReadyForMoreMediaData else {
+            droppedFrames += Int64(nFrames)
+            sourceFrames += Int64(nFrames)
+            silenceOwed += nFrames
+            return
+        }
+
+        try appendPCM(base, frames: nFrames)
+    }
+
+    /// Encode one contiguous run of frames at the current timeline position.
+    /// Caller must have started the writer and checked `isReadyForMoreMediaData`.
+    private func appendPCM(_ base: UnsafePointer<Float>, frames nFrames: Int) throws {
         let dataSize = nFrames * MemoryLayout<Float>.stride
 
         // Copy into a CMBlockBuffer's own memory so we own the lifetime.
@@ -198,20 +230,41 @@ public final class SegmentArchiveWriter: @unchecked Sendable {
         sourceFrames &+= Int64(nFrames)
     }
 
-    /// Advance the timeline without data — used when the *capture* side lost
-    /// frames (ring overflow), so subsequent appends keep wall-clock-aligned
-    /// PTS. The skipped span plays back as a gap of the right duration.
-    public func skip(frames: Int) {
-        sourceFrames += Int64(frames)
+    /// Record that `frames` source frames were lost upstream (ring overflow)
+    /// — the loss is repaid as *encoded silence* on the next append (or at
+    /// finalize), keeping the file's playback timeline wall-clock true. A bare
+    /// PTS jump would not work: the AAC encode flattens it and the timeline
+    /// would silently compress.
+    public func insertSilence(frames: Int) {
+        silenceOwed += frames
+    }
+
+    /// Pay down `silenceOwed` with zero-filled appends while the encoder has
+    /// appetite. Requires `didStart`; leftover debt survives for the next try.
+    private func settleSilenceDebt() throws {
+        guard silenceOwed > 0, !didFail else { return }
+        let zeros = [Float](repeating: 0, count: min(silenceOwed, Self.silenceChunkFrames))
+        while silenceOwed > 0, input.isReadyForMoreMediaData {
+            let n = min(silenceOwed, zeros.count)
+            try zeros.withUnsafeBufferPointer { buf in
+                try appendPCM(buf.baseAddress!, frames: n)
+            }
+            silenceOwed -= n
+        }
     }
 
     /// Mark input finished and wait for AVAssetWriter to flush the final
     /// fragment and finalize the moov atom. Safe to call once.
     public func finalize() async {
         guard didStart else {
-            // Nothing was ever written; nothing to finalize.
+            // Nothing was ever written; nothing to finalize. (Any silence
+            // debt is moot — a recording that never archived a single frame
+            // has no file whose duration could lie.)
             return
         }
+        // Settle remaining debt so the file's duration spans the full
+        // wall-clock recording, even if the last event was a loss.
+        try? settleSilenceDebt()
         input.markAsFinished()
         await writer.finishWriting()
     }
