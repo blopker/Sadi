@@ -1,3 +1,4 @@
+import AppKit
 import SadiKit
 import SwiftUI
 
@@ -443,6 +444,13 @@ private struct TranscriptBlock: Identifiable {
 
     var utteranceIDs: Set<UUID> { Set(paragraphs.flatMap { $0.map(\.id) }) }
     var count: Int { paragraphs.reduce(0) { $0 + $1.count } }
+    /// The block's full text, paragraphs separated by blank lines — what
+    /// "Copy Group" puts on the pasteboard.
+    var text: String {
+        paragraphs
+            .map { $0.map(\.text).joined(separator: " ") }
+            .joined(separator: "\n\n")
+    }
 
     /// Best utterance to enroll a new voiceprint from: prefer an embedding
     /// computed over the segment's own audio (not the ambiguous fallback).
@@ -555,6 +563,7 @@ private struct TranscriptBlockView: View {
                         ForEach(paragraph) { segment in
                             SegmentChip(
                                 utterance: segment,
+                                groupText: block.text,
                                 voiceprints: voiceprints,
                                 locked: locked,
                                 onAssign: { onAssign([segment.id], $0) },
@@ -588,8 +597,14 @@ private struct TranscriptBlockView: View {
 
 /// One segment inside a block: plain body text that flows with its siblings,
 /// but reveals its own extent on hover and reassigns on click.
+///
+/// A real `Button` rather than Text + onTapGesture: `.textSelection` installs
+/// a selection layer that swallows mouse-downs, making tap gestures fire only
+/// sometimes. Clicks are the primary interaction here, so copying moves to
+/// the right-click menu instead of drag-selection.
 private struct SegmentChip: View {
     let utterance: Utterance
+    let groupText: String
     let voiceprints: VoiceprintBook
     let locked: Bool
     let onAssign: (SadiKit.Speaker) -> Void
@@ -599,32 +614,44 @@ private struct SegmentChip: View {
     @State private var showingPopover = false
 
     var body: some View {
-        Text(utterance.text)
-            .font(.body)
-            .textSelection(.enabled)
-            .padding(.horizontal, 2)
-            .padding(.vertical, 1)
-            .background(
-                hovered && !locked ? Color.accentColor.opacity(0.14) : .clear,
-                in: RoundedRectangle(cornerRadius: 4)
-            )
-            .onHover { hovered = $0 }
-            .onTapGesture {
-                if !locked { showingPopover = true }
-            }
-            .help(
-                "\(utterance.startedAt.formatted(date: .omitted, time: .standard))"
-                    + (locked ? "" : " — click to reassign this segment")
-            )
-            .popover(isPresented: $showingPopover) {
-                AssignSpeakerPopover(
-                    utterance: utterance,
-                    voiceprints: voiceprints,
-                    scope: "Applies to this segment only.",
-                    onAssign: onAssign,
-                    onEnroll: onEnroll
+        Button {
+            if !locked { showingPopover = true }
+        } label: {
+            Text(utterance.text)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 2)
+                .padding(.vertical, 1)
+                .background(
+                    hovered && !locked ? Color.accentColor.opacity(0.14) : .clear,
+                    in: RoundedRectangle(cornerRadius: 4)
                 )
-            }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help(
+            "\(utterance.startedAt.formatted(date: .omitted, time: .standard))"
+                + (locked ? "" : " — click to reassign this segment")
+        )
+        .contextMenu {
+            Button("Copy Segment") { copy(utterance.text) }
+            Button("Copy Group") { copy(groupText) }
+        }
+        .popover(isPresented: $showingPopover) {
+            AssignSpeakerPopover(
+                utterance: utterance,
+                voiceprints: voiceprints,
+                scope: "Applies to this segment only.",
+                onAssign: onAssign,
+                onEnroll: onEnroll
+            )
+        }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 }
 
