@@ -66,19 +66,31 @@ public struct Segment: Codable, Sendable {
     public var endedAt: Date?              // nil while this segment is recording
     public var micFilename: String         // e.g. "mic-001.mp4", relative to session dir
     public var systemFilename: String?     // nil in mic-only mode
+    /// Wall clock of each track's sample 0, stamped when its capture actually
+    /// started. The mic anchor ≈ `startedAt`, but the system tap comes up
+    /// ~1.5–2 s later (deferred until the mic settles) — any pass that maps
+    /// file-relative time back to wall-clock (offline finalize/rerun) needs
+    /// the per-track anchor, not the session start. `nil` on older sessions;
+    /// readers fall back to `startedAt` and accept the skew.
+    public var micAnchor: Date?
+    public var systemAnchor: Date?
 
     public init(
         index: Int,
         startedAt: Date,
         endedAt: Date?,
         micFilename: String,
-        systemFilename: String?
+        systemFilename: String?,
+        micAnchor: Date? = nil,
+        systemAnchor: Date? = nil
     ) {
         self.index = index
         self.startedAt = startedAt
         self.endedAt = endedAt
         self.micFilename = micFilename
         self.systemFilename = systemFilename
+        self.micAnchor = micAnchor
+        self.systemAnchor = systemAnchor
     }
 }
 

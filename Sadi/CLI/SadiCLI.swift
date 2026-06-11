@@ -23,6 +23,9 @@ enum SadiCLI {
             case .replay(let options):
                 try await replay(options)
                 return 0
+            case .offline(let mode, let session):
+                try await offline(mode: mode, session: session)
+                return 0
             }
         } catch let error as CLIError {
             stderr("error: \(error.message)")
@@ -45,14 +48,26 @@ enum SadiCLI {
     enum Command {
         case help
         case replay(ReplayOptions)
+        case offline(OfflinePipeline.Mode, String?)
     }
 
     static func parse(_ args: [String]) throws -> Command {
         if args.isEmpty || args.contains("-h") || args.contains("--help") {
             return .help
         }
+        if args[0] == "finalize" || args[0] == "rerun" {
+            let mode: OfflinePipeline.Mode = args[0] == "finalize" ? .finalize : .rerun
+            let rest = args.dropFirst()
+            if let bad = rest.first(where: { $0.hasPrefix("-") }) {
+                throw CLIError("unknown option '\(bad)'.")
+            }
+            guard rest.count <= 1 else {
+                throw CLIError("unexpected extra argument '\(rest.dropFirst().first!)'.")
+            }
+            return .offline(mode, rest.first)
+        }
         guard args[0] == "replay" else {
-            throw CLIError("unknown command '\(args[0])'. The only command is 'replay'.")
+            throw CLIError("unknown command '\(args[0])'. Commands: replay, finalize, rerun.")
         }
 
         var options = ReplayOptions()
@@ -143,6 +158,60 @@ enum SadiCLI {
 
         // 5. Print results (stdout) + summary; dropped detail to stderr.
         printResults(store, mode: tracks.contains { $0.source == .system } ? "call/mixed" : "mic-only")
+    }
+
+    // MARK: - Offline finalize / rerun
+
+    /// Run the offline pipeline over a saved session. Unlike `replay`, this
+    /// WRITES: transcript.json is replaced (generator finalize/rerun) and
+    /// session.json's `needsFinalize` is cleared — exactly what the GUI's
+    /// post-stop finalize and Rerun button do.
+    static func offline(mode: OfflinePipeline.Mode, session: String?) async throws {
+        let sessionDir = try resolveSession(session)
+        stderr("Session: \(sessionDir.lastPathComponent)")
+        stderr("  dir: \(sessionDir.path(percentEncoded: false))")
+
+        guard ModelHost.modelsPresent() else {
+            throw CLIError(
+                "models not downloaded. Launch the Sadi app once to fetch them, then retry.",
+                code: 2
+            )
+        }
+        stderr("Loading models…")
+        let host = ModelHost()
+        await host.loadIfNeeded()
+        guard host.state == .ready else {
+            if case .failed(let message) = host.state {
+                throw CLIError("model load failed: \(message)")
+            }
+            throw CLIError("model load failed.")
+        }
+
+        let book = VoiceprintBook(
+            storeURL: SadiApp.voiceprintBookURL(),
+            modelVersion: ModelHost.embeddingModelVersion
+        )
+        stderr("Voiceprints loaded: \(book.prints.count)")
+
+        let outcome = try await OfflinePipeline.run(
+            mode: mode,
+            sessionDirectory: sessionDir,
+            modelHost: host,
+            voiceprints: book,
+            progress: { stderr("  \($0)") }
+        )
+
+        let utterances = RecordingsStore.loadTranscript(from: sessionDir)
+        print("────── Transcript (\(utterances.count)) ──────")
+        for u in utterances { print(row(u, marker: "✓")) }
+        print("""
+
+        ────── Summary ──────
+        mode:            \(outcome.mode.rawValue)
+        kept:            \(outcome.utteranceCount)
+        dropped (echo):  \(outcome.droppedAsEcho)
+        voiceprint hits: \(outcome.voiceprintHits)
+        """)
     }
 
     // MARK: - Session resolution
@@ -243,6 +312,17 @@ enum SadiCLI {
 
     USAGE:
       Sadi cli replay [OPTIONS] [SESSION]
+      Sadi cli finalize [SESSION]
+      Sadi cli rerun [SESSION]
+
+    COMMANDS:
+      replay         Re-drive the live streaming pipeline from the session's
+                     audio. Read-only; prints the transcript to stdout.
+      finalize       Offline post-pass: keep the saved transcript's text,
+                     re-derive speakers (offline diarization + voiceprints)
+                     and echo filtering. WRITES transcript.json/session.json.
+      rerun          Full regeneration from audio: offline VAD + batch ASR +
+                     the finalize tail. WRITES transcript.json/session.json.
 
     ARGS:
       SESSION        Session id (e.g. 2026-05-28-14-03-09) or a path to a

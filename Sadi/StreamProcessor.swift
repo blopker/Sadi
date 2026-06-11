@@ -220,7 +220,7 @@ actor StreamProcessor {
             // Per-token timing → split this VAD segment into one Utterance per
             // speaker-coherent word run. `Sadi cli replay` drives this exact
             // path from recorded files (see Sadi/CLI/FileReplayDriver.swift).
-            let words = groupTokensIntoWords(timings)
+            let words = AsrWords.group(timings)
             let runs = SpeakerSegmenter.splitIntoRuns(
                 tokens: words,
                 speakerAt: { [self] wordTimeRelative in
@@ -315,43 +315,6 @@ actor StreamProcessor {
     }
 
     // MARK: - Per-token speaker queries
-
-    /// Group Parakeet's subword tokens into whole words. FluidAudio's ASR
-    /// normalizes `▁` → " " before populating TokenTiming.token, so a word
-    /// starts at any token whose text begins with a space (or, defensively,
-    /// the raw `▁` marker if a future version stops normalizing).
-    private func groupTokensIntoWords(_ timings: [TokenTiming]) -> [TimedToken] {
-        var words: [TimedToken] = []
-        var currentTexts: [String] = []
-        var currentStart: TimeInterval = 0
-        var currentEnd: TimeInterval = 0
-        for tt in timings {
-            let startsWord = tt.token.hasPrefix(" ") || tt.token.hasPrefix("▁")
-            if startsWord && !currentTexts.isEmpty {
-                words.append(
-                    TimedToken(
-                        text: currentTexts.joined(),
-                        startTime: currentStart,
-                        endTime: currentEnd
-                    ))
-                currentTexts = []
-            }
-            if currentTexts.isEmpty {
-                currentStart = tt.startTime
-            }
-            currentTexts.append(tt.token)
-            currentEnd = tt.endTime
-        }
-        if !currentTexts.isEmpty {
-            words.append(
-                TimedToken(
-                    text: currentTexts.joined(),
-                    startTime: currentStart,
-                    endTime: currentEnd
-                ))
-        }
-        return words
-    }
 
     /// Dominant cluster id over [startSec, endSec) across the diarizer's
     /// finalized + tentative segments. Falls back to nil when the diarizer

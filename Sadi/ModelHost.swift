@@ -32,6 +32,12 @@ final class ModelHost {
     private(set) var asrModels: AsrModels?
     private(set) var diarizerModel: LSEENDModel?
     private(set) var embeddingDiarizer: DiarizerManager?
+    /// Offline (batch) diarization model set — loaded lazily on the first
+    /// finalize/rerun pass, NOT at app start: it's a separate ~100 MB download
+    /// (Segmentation/FBank/Embedding/PldaRho, HF variant "offline") that a
+    /// user who never reruns a transcript shouldn't pay for. The task is
+    /// memoized so concurrent passes share one download/compile.
+    private var offlineDiarizerModelsTask: Task<OfflineDiarizerModels, Error>?
 
     /// Stable identifier for the speaker-embedding model. Stamped into each
     /// `Voiceprint` so we can detect (and refuse to match against) prints
@@ -51,6 +57,25 @@ final class ModelHost {
             var isDir: ObjCBool = false
             let path = root.appending(path: name, directoryHint: .isDirectory).path(percentEncoded: false)
             return fm.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+        }
+    }
+
+    /// Load (downloading on first use) the offline diarizer models. Memoized;
+    /// a failed attempt clears the memo so the next pass can retry.
+    /// `OfflineDiarizerModels` is Sendable — callers construct their own
+    /// (non-Sendable) `OfflineDiarizerManager` from it inside whatever task
+    /// runs the pass.
+    func loadOfflineDiarizerModels() async throws -> OfflineDiarizerModels {
+        let task = offlineDiarizerModelsTask ?? Task.detached(priority: .userInitiated) {
+            try await OfflineDiarizerModels.load()
+        }
+        offlineDiarizerModelsTask = task
+        do {
+            return try await task.value
+        } catch {
+            Self.log.error("Offline diarizer load failed: \(String(describing: error), privacy: .public)")
+            offlineDiarizerModelsTask = nil
+            throw error
         }
     }
 

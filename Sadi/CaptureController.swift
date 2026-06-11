@@ -142,6 +142,7 @@ final class CaptureController {
                     writer: micWriter,
                     processor: processor,
                     segmentFilename: micURL.lastPathComponent,
+                    anchor: anchor,
                     publish: { [weak self] level in
                         self?.micLevel = level
                     },
@@ -231,6 +232,7 @@ final class CaptureController {
                     writer: systemWriter,
                     processor: processor,
                     segmentFilename: systemURL.lastPathComponent,
+                    anchor: anchor,
                     publish: { [weak self] level in
                         self?.systemLevel = level
                     },

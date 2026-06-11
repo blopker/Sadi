@@ -73,6 +73,10 @@ final class StreamPipeline {
     /// Filename of the segment archive opened for this stream — recorded into
     /// `session.json` so the metadata reflects what's actually on disk.
     let segmentFilename: String
+    /// Wall clock of this stream's sample 0 (same instant handed to the
+    /// StreamProcessor as `startWallClock`). Persisted into `session.json` so
+    /// offline passes can map file-relative time back to wall-clock.
+    let anchor: Date
     /// Drains the ring to the MP4. Cancel + await *after* `capture.stop()`:
     /// it drains the ring tail, finishes the inference channel, and finalizes
     /// the MP4 before returning.
@@ -99,12 +103,14 @@ final class StreamPipeline {
         writer: SegmentArchiveWriter,
         processor: StreamProcessor,
         segmentFilename: String,
+        anchor: Date,
         publish: @escaping @MainActor (Float) -> Void,
         onStall: @escaping @MainActor () -> Void
     ) {
         self.source = source
         self.capture = capture
         self.segmentFilename = segmentFilename
+        self.anchor = anchor
 
         let (events, feed) = AsyncStream.makeStream(
             of: InferenceEvent.self, bufferingPolicy: .unbounded
@@ -396,7 +402,9 @@ final class ActiveSession {
             startedAt: startedAt,
             endedAt: endedAt,
             micFilename: pipeline(for: .mic)?.segmentFilename ?? "mic-001.mp4",
-            systemFilename: pipeline(for: .system)?.segmentFilename
+            systemFilename: pipeline(for: .system)?.segmentFilename,
+            micAnchor: pipeline(for: .mic)?.anchor,
+            systemAnchor: pipeline(for: .system)?.anchor
         )
         let metadata = Session(
             id: paths.id,
@@ -404,7 +412,8 @@ final class ActiveSession {
             startedAt: startedAt,
             endedAt: endedAt,
             segments: [segment],
-            speakerClusters: []
+            speakerClusters: [],
+            needsFinalize: true
         )
         let directory = paths.directory
         do {
