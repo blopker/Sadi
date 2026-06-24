@@ -152,18 +152,24 @@ actor StreamProcessor {
         }
         streamState = stepResult.state
 
-        guard let event = stepResult.event else { return }
-        switch event.kind {
-        case .speechStart:
-            pendingSpeechStart = Int64(event.sampleIndex)
-        case .speechEnd:
-            guard let start = pendingSpeechStart else { return }
-            pendingSpeechStart = nil
-            let end = Int64(event.sampleIndex)
-            await emit(absoluteStart: start, absoluteEnd: end)
+        if let event = stepResult.event {
+            switch event.kind {
+            case .speechStart:
+                pendingSpeechStart = Int64(event.sampleIndex)
+            case .speechEnd:
+                if let start = pendingSpeechStart {
+                    pendingSpeechStart = nil
+                    await emit(absoluteStart: start, absoluteEnd: Int64(event.sampleIndex))
+                }
+            }
         }
 
-        // Force-split very long speech to stay under the 15 s model cap.
+        // Force-split very long speech to stay under the 15 s model cap. This
+        // must run on every chunk — including the no-VAD-event chunks that make
+        // up the body of a continuous monologue, which is the exact case it
+        // exists for. (Previously it sat below an early `return` on no-event
+        // chunks, so a pause-free monologue emitted nothing until speech ended
+        // — long enough for the idle auto-stop to fire mid-sentence.)
         if let start = pendingSpeechStart {
             let current = Int64(streamState.processedSamples)
             if current - start >= Int64(maxSpeechSamples) {
