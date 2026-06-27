@@ -104,7 +104,7 @@ enum OfflinePipeline {
         progress("Decoding audio…")
         let sessionStart = session.startedAt
         let tracks = try await hop {
-            try decodeTracks(segment: segment, sessionStart: sessionStart, directory: sessionDirectory)
+            try await decodeTracks(segment: segment, sessionStart: sessionStart, directory: sessionDirectory)
         }
         guard !tracks.isEmpty else { throw Failure.noAudio }
 
@@ -260,7 +260,7 @@ enum OfflinePipeline {
 
     nonisolated private static func decodeTracks(
         segment: Segment, sessionStart: Date, directory: URL
-    ) throws -> [Track] {
+    ) async throws -> [Track] {
         var specs: [(Source, String, Date)] = [
             (.mic, segment.micFilename, segment.micAnchor ?? sessionStart)
         ]
@@ -275,7 +275,7 @@ enum OfflinePipeline {
             guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else {
                 continue
             }
-            let samples = try decode16kMono(url)
+            let samples = try await decode16kMono(url)
             if !samples.isEmpty {
                 tracks.append(Track(source: source, anchor: anchor, samples: samples))
             }
@@ -286,11 +286,12 @@ enum OfflinePipeline {
     /// Decode an archive MP4 to 16 kHz mono Float32 in one pass —
     /// AVAssetReader does the AAC decode and the resample for us. Whole-file
     /// in memory: ~230 MB per hour of audio, acceptable for typical sessions.
-    nonisolated static func decode16kMono(_ url: URL) throws -> [Float] {
+    nonisolated static func decode16kMono(_ url: URL) async throws -> [Float] {
         let asset = AVURLAsset(url: url)
         let reader = try AVAssetReader(asset: asset)
-        // Synchronous track load: this always runs inside a detached task.
-        guard let track = asset.tracks(withMediaType: .audio).first else {
+        // Async track load (the only non-deprecated accessor); the sample-read
+        // loop below stays synchronous. Always runs inside a detached task.
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
             throw Failure.decodeFailed("no audio track in \(url.lastPathComponent)")
         }
         let settings: [String: Any] = [
