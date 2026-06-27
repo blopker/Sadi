@@ -12,6 +12,7 @@ struct RootView: View {
     let voiceprints: VoiceprintBook
     let controller: CaptureController
     let jobs: TranscriptionJobs
+    let llm: LLMClient
 
     @State private var selection: SidebarItem = .recordings
     // The Recordings tab's nav path lives here so the app-wide record button
@@ -96,7 +97,7 @@ struct RootView: View {
                 recordingsPath = [.detail(item)]
             }
         case .settings:
-            SettingsView(modelHost: modelHost)
+            SettingsView(modelHost: modelHost, llm: llm)
         }
     }
 
@@ -166,6 +167,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 /// remembers itself; none are wired into the pipeline yet.
 private struct SettingsView: View {
     let modelHost: ModelHost
+    let llm: LLMClient
 
     @AppStorage("settings.showDroppedByDefault") private var showDroppedByDefault = false
     @AppStorage("settings.launchAtLogin") private var launchAtLogin = false
@@ -173,6 +175,9 @@ private struct SettingsView: View {
     @AppStorage(AutoStopSettings.enabledKey) private var autoStopEnabled = false
     @AppStorage(AutoStopSettings.minutesKey) private var autoStopMinutes = AutoStopSettings
         .defaultMinutes
+    @AppStorage(LLMSettings.baseURLKey) private var llmBaseURL = LLMSettings.defaultBaseURL
+    @AppStorage(LLMSettings.apiKeyKey) private var llmAPIKey = ""
+    @AppStorage(LLMSettings.modelKey) private var llmModel = ""
 
     var body: some View {
         Form {
@@ -205,6 +210,40 @@ private struct SettingsView: View {
                 Toggle("Launch Sadi at login", isOn: $launchAtLogin)
             }
 
+            Section {
+                TextField("Server URL", text: $llmBaseURL)
+                    .textFieldStyle(.roundedBorder)
+                    .textContentType(.URL)
+                    .autocorrectionDisabled()
+                    .onSubmit(probeServer)
+                SecureField("API key", text: $llmAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(probeServer)
+                if !llm.models.isEmpty {
+                    Picker("Model", selection: $llmModel) {
+                        // Keep a stored-but-now-absent model selectable rather
+                        // than letting the Picker fall blank if the server's
+                        // model list changed.
+                        if !llmModel.isEmpty, !llm.models.contains(llmModel) {
+                            Text("\(llmModel) (unavailable)").tag(llmModel)
+                        }
+                        ForEach(llm.models, id: \.self) { Text($0).tag($0) }
+                    }
+                }
+                LabeledContent("Status") {
+                    HStack(spacing: 8) {
+                        llmStatusText
+                        Button("Test", action: probeServer)
+                            .buttonStyle(.borderless)
+                    }
+                }
+            } header: {
+                Text("AI Features")
+            } footer: {
+                Text("Optional. Connect an OpenAI-compatible local server (e.g. omlx) to enable transcript cleanup and titling. When the server is offline these extra steps are skipped.")
+            }
+            .task { await llm.refresh(config: llmConfig) }
+
             Section("Models") {
                 LabeledContent("Status") {
                     modelStatusText
@@ -214,6 +253,31 @@ private struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Settings")
+    }
+
+    /// The server config as currently entered in the form.
+    private var llmConfig: LLMSettings.Config {
+        LLMSettings.Config(baseURL: llmBaseURL, apiKey: llmAPIKey, model: llmModel)
+    }
+
+    /// Re-probe the server (on field submit or the Test button). Reads the live
+    /// field values, so it reflects exactly what's typed.
+    private func probeServer() {
+        Task { await llm.refresh(config: llmConfig) }
+    }
+
+    @ViewBuilder
+    private var llmStatusText: some View {
+        switch llm.status {
+        case .idle:
+            Text("Not connected").foregroundStyle(.secondary)
+        case .checking:
+            Text("Checking…").foregroundStyle(.secondary)
+        case .connected(let count):
+            Text("Connected — \(count) model\(count == 1 ? "" : "s")").foregroundStyle(.green)
+        case .failed(let message):
+            Text(message).foregroundStyle(.red)
+        }
     }
 
     @ViewBuilder

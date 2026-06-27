@@ -76,6 +76,7 @@ struct SadiApp: App {
     @State private var transcript: TranscriptStore
     @State private var controller: CaptureController
     @State private var jobs: TranscriptionJobs
+    @State private var llm: LLMClient
 
     init() {
         let host = ModelHost()
@@ -98,6 +99,7 @@ struct SadiApp: App {
         _transcript = State(initialValue: store)
         _controller = State(initialValue: controller)
         _jobs = State(initialValue: jobs)
+        _llm = State(initialValue: LLMClient())
     }
 
     var body: some Scene {
@@ -107,7 +109,8 @@ struct SadiApp: App {
                 transcript: transcript,
                 voiceprints: voiceprints,
                 controller: controller,
-                jobs: jobs
+                jobs: jobs,
+                llm: llm
             )
             .frame(minWidth: 900, minHeight: 520)
             .task {
