@@ -18,7 +18,7 @@ final class LLMClient {
     enum Status: Equatable {
         case idle
         case checking
-        case connected(models: Int)
+        case connected
         case failed(String)
     }
 
@@ -46,7 +46,7 @@ final class LLMClient {
         do {
             let ids = try await fetchModels(config: config)
             models = ids
-            status = .connected(models: ids.count)
+            status = .connected
             Self.log.notice("LLM server connected: \(ids.count) models")
         } catch {
             models = []

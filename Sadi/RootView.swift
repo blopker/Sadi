@@ -220,20 +220,18 @@ private struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(probeServer)
                 if !llm.models.isEmpty {
-                    Picker("Model", selection: $llmModel) {
-                        // Keep a stored-but-now-absent model selectable rather
-                        // than letting the Picker fall blank if the server's
-                        // model list changed.
-                        if !llmModel.isEmpty, !llm.models.contains(llmModel) {
-                            Text("\(llmModel) (unavailable)").tag(llmModel)
-                        }
+                    Picker("Model", selection: modelSelection) {
                         ForEach(llm.models, id: \.self) { Text($0).tag($0) }
+                    }
+                } else if case .connected = llm.status {
+                    LabeledContent("Model") {
+                        Text("No models available").foregroundStyle(.secondary)
                     }
                 }
                 LabeledContent("Status") {
                     HStack(spacing: 8) {
                         llmStatusText
-                        Button("Test", action: probeServer)
+                        Button("Refresh", action: probeServer)
                             .buttonStyle(.borderless)
                     }
                 }
@@ -243,6 +241,14 @@ private struct SettingsView: View {
                 Text("Optional. Connect an OpenAI-compatible local server (e.g. omlx) to enable transcript cleanup and titling. When the server is offline these extra steps are skipped.")
             }
             .task { await llm.refresh(config: llmConfig) }
+            .onChange(of: llm.models) { _, models in
+                // Once the server's models arrive, lock in a concrete default so
+                // the pipeline reads a real model id (not the empty initial
+                // value) — and re-default if the prior choice is gone.
+                if !models.isEmpty, !models.contains(llmModel) {
+                    llmModel = models.first ?? ""
+                }
+            }
 
             Section("Models") {
                 LabeledContent("Status") {
@@ -260,6 +266,17 @@ private struct SettingsView: View {
         LLMSettings.Config(baseURL: llmBaseURL, apiKey: llmAPIKey, model: llmModel)
     }
 
+    /// Picker binding that coerces an empty or now-absent stored model to the
+    /// first available one, so the Picker's selection always matches a tag (no
+    /// "invalid selection" console warning) while `onChange` persists the real
+    /// default to storage.
+    private var modelSelection: Binding<String> {
+        Binding(
+            get: { llm.models.contains(llmModel) ? llmModel : (llm.models.first ?? "") },
+            set: { llmModel = $0 }
+        )
+    }
+
     /// Re-probe the server (on field submit or the Test button). Reads the live
     /// field values, so it reflects exactly what's typed.
     private func probeServer() {
@@ -273,8 +290,8 @@ private struct SettingsView: View {
             Text("Not connected").foregroundStyle(.secondary)
         case .checking:
             Text("Checking…").foregroundStyle(.secondary)
-        case .connected(let count):
-            Text("Connected — \(count) model\(count == 1 ? "" : "s")").foregroundStyle(.green)
+        case .connected:
+            Text("Connected").foregroundStyle(.green)
         case .failed(let message):
             Text(message).foregroundStyle(.red)
         }
