@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 import SadiKit
@@ -178,56 +179,148 @@ final class TranscriptStore {
     /// here. The session's fragmented MP4s remain the source of truth and the
     /// transcript can be re-derived from them (transcription is cheap).
     func writeTranscript(to directory: URL) async throws {
-        // Snapshot the main-actor state here, then hand the encode + atomic write
-        // to a detached task so the JSON work and disk I/O stay off the main
-        // thread — matching how `stop()` offloads the rest of its teardown.
-        // `TranscriptDocument` is `Sendable`, so it crosses into the task safely.
+        // Snapshot the main-actor state here; the coordinator actor does the
+        // encode + atomic write off the main thread and serializes it against
+        // any other transcript rewrite for the session.
         let doc = TranscriptDocument(
             schemaVersion: 2,
             sessionID: directory.lastPathComponent,
             generator: .live,
             utterances: utterances
         )
-        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
-        try await Task.detached(priority: .userInitiated) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(doc)
-            try data.write(to: url, options: .atomic)
-        }.value
+        try await TranscriptDocumentFileCoordinator.shared.save(doc, to: directory)
     }
 }
 
 /// On-disk shape of `transcript.json`. `schemaVersion` lets a later reader
 /// migrate older files; `Utterance` is already `Codable` (SadiKit).
 /// `nonisolated` so its `Codable` conformance can run off the main actor (the
-/// app builds with default main-actor isolation). `writeTranscript` encodes it
-/// inside a detached task; `RecordingsStore` decodes it. Members are all value
-/// types from SadiKit, so this is safe.
+/// app builds with default main-actor isolation). `load`/`write` below are the
+/// single definition of the on-disk coding; all rewrites go through
+/// `TranscriptDocumentFileCoordinator`. Members are all value types from
+/// SadiKit, so this is safe.
 nonisolated struct TranscriptDocument: Codable, Sendable {
     let schemaVersion: Int
     let sessionID: String
     /// Which pass produced this document. `nil` = schema-v1 live transcript.
     let generator: Generator?
     let utterances: [Utterance]
+    /// For `.cleaned` documents: the `contentHash` of the raw transcript this
+    /// was derived from, so the UI can tell when the cleaned copy has fallen
+    /// behind the raw one (e.g. a rerun changed the words while the LLM server
+    /// was offline). `nil` for raw/live/finalize/rerun documents.
+    let sourceHash: String?
 
     /// Schema v2: live = streaming pipeline at record time; finalize =
     /// post-stop offline diarization/echo pass over the draft; rerun = full
-    /// from-audio regeneration.
+    /// from-audio regeneration; cleaned = optional LLM cleanup pass over a
+    /// finalized transcript (stored separately, never overwrites the raw).
     nonisolated enum Generator: String, Codable, Sendable {
         case live
         case finalize
         case rerun
+        case cleaned
     }
 
+    /// The optional LLM-cleaned copy, stored beside `transcript.json`.
+    static let cleanedFilename = "transcript.cleaned.json"
+
     init(
-        schemaVersion: Int, sessionID: String, generator: Generator?, utterances: [Utterance]
+        schemaVersion: Int, sessionID: String, generator: Generator?,
+        utterances: [Utterance], sourceHash: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.sessionID = sessionID
         self.generator = generator
         self.utterances = utterances
+        self.sourceHash = sourceHash
+    }
+
+    /// Copy with the utterance list swapped and every other field preserved.
+    /// The document is immutable-by-field, so this is how rewrite passes
+    /// (pins, re-attribution, cleanup stitching) produce their output.
+    func replacingUtterances(_ utterances: [Utterance]) -> TranscriptDocument {
+        TranscriptDocument(
+            schemaVersion: schemaVersion, sessionID: sessionID, generator: generator,
+            utterances: utterances, sourceHash: sourceHash)
+    }
+
+    /// Decode a session directory's transcript. `nil` when the file is missing
+    /// or unreadable. Reads need no coordination; call from any executor.
+    static func load(from directory: URL, filename: String = "transcript.json") -> TranscriptDocument? {
+        let url = directory.appending(path: filename, directoryHint: .notDirectory)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(TranscriptDocument.self, from: data)
+    }
+
+    /// Atomic encode + write. `fileprivate` on purpose: all writers must go
+    /// through `TranscriptDocumentFileCoordinator` (same file) so competing
+    /// read/modify/write passes cannot overtake each other.
+    fileprivate func write(to directory: URL, filename: String = "transcript.json") throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(self)
+        let url = directory.appending(path: filename, directoryHint: .notDirectory)
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// Stable fingerprint of the cleanup-relevant content — each utterance's
+    /// id + text, in order. Speaker re-pins (which don't touch text) leave it
+    /// unchanged; a rerun that alters the words changes it. Used to flag a
+    /// `.cleaned` document as out of date against its raw transcript.
+    static func contentHash(_ utterances: [Utterance]) -> String {
+        var hasher = SHA256()
+        for u in utterances {
+            hasher.update(data: Data(u.id.uuidString.utf8))
+            hasher.update(data: Data([0x1f]))
+            hasher.update(data: Data(u.text.utf8))
+            hasher.update(data: Data([0x0a]))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Serializes transcript file mutations across every writer — live stop,
+/// offline finalize/rerun, cleanup, manual pins, re-attribution. Atomic writes
+/// protect against a torn file; this protects against lost updates from
+/// competing read/modify/write passes.
+actor TranscriptDocumentFileCoordinator {
+    static let shared = TranscriptDocumentFileCoordinator()
+
+    func save(
+        _ doc: TranscriptDocument, to directory: URL, filename: String = "transcript.json"
+    ) throws {
+        try doc.write(to: directory, filename: filename)
+    }
+
+    /// Read the latest on-disk document, transform, write. The transform also
+    /// returns a caller value (e.g. a change count) — it is the only code that
+    /// sees both the before and after documents. Returns `nil` when the
+    /// transcript is missing or the transform declines.
+    @discardableResult
+    func update<Extra: Sendable>(
+        directory: URL,
+        _ transform: @Sendable (TranscriptDocument) -> (TranscriptDocument, Extra)?
+    ) throws -> (document: TranscriptDocument, extra: Extra)? {
+        guard let current = TranscriptDocument.load(from: directory),
+              let (updated, extra) = transform(current)
+        else { return nil }
+        try updated.write(to: directory)
+        return (updated, extra)
+    }
+
+    /// Read-modify-write without a side value.
+    @discardableResult
+    func update(
+        directory: URL,
+        _ transform: @Sendable (TranscriptDocument) -> TranscriptDocument?
+    ) throws -> TranscriptDocument? {
+        try update(directory: directory) { doc in
+            transform(doc).map { ($0, ()) }
+        }?.document
     }
 }
 

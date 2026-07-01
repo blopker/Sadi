@@ -61,8 +61,9 @@ enum OfflinePipeline {
     /// Off-main hop that *forwards cancellation*: `Task.detached` deliberately
     /// doesn't inherit the awaiting task's cancellation, so without this a
     /// cancelled pass would keep diarizing/transcribing to completion in the
-    /// background. Used for every interruptible stage; the final save uses a
-    /// plain detached task so a last-instant cancel can't tear the write.
+    /// background. Used for every interruptible stage; the final saves go
+    /// through the file coordinator and a plain detached task, neither of
+    /// which observes cancellation, so a last-instant cancel can't tear them.
     nonisolated private static func hop<T: Sendable>(
         _ body: @escaping @Sendable @concurrent () async throws -> T
     ) async throws -> T {
@@ -81,6 +82,7 @@ enum OfflinePipeline {
         sessionDirectory: URL,
         modelHost: ModelHost,
         voiceprints: VoiceprintBook,
+        llmConfig: LLMSettings.Config? = nil,
         progress: @escaping @MainActor (String) -> Void = { _ in }
     ) async throws -> Outcome {
         guard let embedder = modelHost.embeddingDiarizer,
@@ -215,10 +217,22 @@ enum OfflinePipeline {
         )
         session.needsFinalize = false
         let sessionSnapshot = session
+        // Transcript rewrite goes through the coordinator so it can't race a
+        // manual pin's save; session.json has no competing writers.
+        try await TranscriptDocumentFileCoordinator.shared.save(doc, to: sessionDirectory)
         try await Task.detached(priority: .userInitiated) {
-            try write(doc, to: sessionDirectory)
             try sessionSnapshot.write(to: sessionDirectory)
         }.value
+
+        // Optional LLM cleanup pass — best effort, run after the raw transcript
+        // is safely persisted. Writes transcript.cleaned.json only on a fully
+        // successful pass; a server outage or cancellation leaves any existing
+        // cleaned copy untouched (never overwritten with a partial result).
+        if let llmConfig {
+            await runCleanup(
+                final, sessionID: sessionDirectory.lastPathComponent,
+                directory: sessionDirectory, config: llmConfig, progress: progress)
+        }
 
         Self.log.notice(
             "Offline \(mode.rawValue, privacy: .public) done: \(final.count) utterances, \(echoDropped) echo-dropped, \(voiceprintHits) voiceprint hits"
@@ -706,12 +720,32 @@ enum OfflinePipeline {
 
     // MARK: - Output
 
-    nonisolated private static func write(_ doc: TranscriptDocument, to directory: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(doc)
-        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
-        try data.write(to: url, options: .atomic)
+    /// Best-effort LLM cleanup over the finalized utterances. Errors and
+    /// cancellation are swallowed (logged): the raw transcript is already
+    /// saved, and we never overwrite an existing cleaned copy with a partial
+    /// or failed result. The `sourceHash` stamps which raw transcript this was
+    /// derived from so the UI can flag it stale after a later rerun.
+    private static func runCleanup(
+        _ final: [Utterance], sessionID: String, directory: URL,
+        config: LLMSettings.Config, progress: @escaping @MainActor (String) -> Void
+    ) async {
+        progress("Cleaning up transcript…")
+        do {
+            let cleaned = try await TranscriptCleanup.run(
+                utterances: final, config: config
+            ) { done, total in
+                progress("Cleaning up transcript… \(done)/\(total)")
+            }
+            let doc = TranscriptDocument(
+                schemaVersion: 2, sessionID: sessionID, generator: .cleaned,
+                utterances: cleaned, sourceHash: TranscriptDocument.contentHash(final))
+            try await TranscriptDocumentFileCoordinator.shared.save(
+                doc, to: directory, filename: TranscriptDocument.cleanedFilename)
+            Self.log.notice("Cleanup wrote \(cleaned.count) utterances for \(sessionID, privacy: .public)")
+        } catch {
+            Self.log.notice(
+                "Cleanup skipped for \(sessionID, privacy: .public) (\(String(describing: error), privacy: .public)) — existing cleaned copy kept"
+            )
+        }
     }
 }

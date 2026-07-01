@@ -44,7 +44,7 @@ final class RecordingsStore {
     /// Decode a finalized recording's `transcript.json` into utterances.
     /// `nonisolated` so callers can (and should) run it off the main actor.
     nonisolated static func loadTranscript(from directory: URL) -> [Utterance] {
-        loadDocument(from: directory)?.utterances ?? []
+        TranscriptDocument.load(from: directory)?.utterances ?? []
     }
 
     /// Build the `RecordingItem` for a single session directory — used to
@@ -61,26 +61,6 @@ final class RecordingsStore {
         return RecordingItem(session: session, directory: directory)
     }
 
-    /// Full-document load — for callers that rewrite the transcript (manual
-    /// speaker pinning, re-attribution) and must preserve the generator tag.
-    nonisolated static func loadDocument(from directory: URL) -> TranscriptDocument? {
-        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? decoder.decode(TranscriptDocument.self, from: data)
-    }
-
-    /// Atomic transcript rewrite, same encoder settings as the live store's
-    /// `writeTranscript`.
-    nonisolated static func saveDocument(_ doc: TranscriptDocument, to directory: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(doc)
-        let url = directory.appending(path: "transcript.json", directoryHint: .notDirectory)
-        try data.write(to: url, options: .atomic)
-    }
 }
 
 /// Plain value that crosses between the background scan and the UI —
@@ -280,13 +260,41 @@ private struct RecordingDetailView: View {
     let isRecording: Bool
 
     @State private var document: TranscriptDocument?
+    /// The optional LLM-cleaned copy (`transcript.cleaned.json`), loaded
+    /// alongside the raw one; `nil` when the cleanup pass hasn't run.
+    @State private var cleanedDocument: TranscriptDocument?
+    /// Whether the list is showing the cleaned copy rather than the original.
+    @State private var showCleaned = false
+    /// The cleaned copy was built from an earlier version of the raw transcript
+    /// (a later rerun changed the words) — surfaces a "rerun to refresh" badge.
+    @State private var cleanupStale = false
     @State private var loaded = false
 
     private var utterances: [Utterance] { document?.utterances ?? [] }
-    /// What the list shows: filler-only rows ("Um.") hidden, presentation
-    /// only — the document keeps them, and pins still resolve by id.
+    /// Whether there's a cleaned copy to toggle to.
+    private var cleanupAvailable: Bool { cleanedDocument != nil }
+    /// What the list shows: the cleaned copy when toggled on (and present),
+    /// otherwise the raw transcript; filler-only rows ("Um.") hidden either way.
+    ///
+    /// The cleaned doc is a text snapshot, but speaker assignments live on the
+    /// raw doc (manual re-pins update it). So when showing the cleaned copy we
+    /// overlay the current speaker/provenance by id, keeping a re-pin made while
+    /// viewing the original reflected here too.
     private var visibleUtterances: [Utterance] {
-        utterances.filter { !FillerWords.isFillerOnly($0.text) }
+        guard showCleaned, let cleaned = cleanedDocument else {
+            return utterances.filter { !FillerWords.isFillerOnly($0.text) }
+        }
+        let raw = Dictionary(
+            (document?.utterances ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return cleaned.utterances
+            .filter { !FillerWords.isFillerOnly($0.text) }
+            .map { u in
+                guard let r = raw[u.id] else { return u }
+                var copy = u
+                copy.speaker = r.speaker
+                copy.assignmentKind = r.assignmentKind
+                return copy
+            }
     }
     /// A finalize/rerun for this session is queued or running — lock edits so
     /// a manual pin can't race the transcript rewrite.
@@ -308,7 +316,7 @@ private struct RecordingDetailView: View {
                             TranscriptBlockView(
                                 block: block,
                                 voiceprints: voiceprints,
-                                locked: jobBusy,
+                                locked: jobBusy || showCleaned,
                                 onAssign: { ids, speaker in pin(ids, to: speaker) },
                                 onEnroll: { name, representative, ids in
                                     enroll(name: name, from: representative, ids: ids)
@@ -322,20 +330,46 @@ private struct RecordingDetailView: View {
         }
         .navigationTitle(title)
         .safeAreaInset(edge: .top) {
-            if let active = jobs.active, active.kind.sessionID == item.session.id {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text(bannerLabel(for: active))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+            VStack(spacing: 0) {
+                if let active = jobs.active, active.kind.sessionID == item.session.id {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(bannerLabel(for: active))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.bar)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(.bar)
+                if cleanupStale {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text("Cleaned transcript is out of date — rerun to refresh it.")
+                        Spacer()
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.bar)
+                }
             }
         }
         .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Toggle(isOn: $showCleaned) {
+                    Label("Cleaned", systemImage: "sparkles")
+                }
+                .toggleStyle(.button)
+                .disabled(!cleanupAvailable)
+                .help(
+                    cleanupAvailable
+                        ? "Switch between the original transcript and the AI-cleaned version."
+                        : "No cleaned transcript yet — connect an LLM server, then finalize or rerun."
+                )
+            }
             ToolbarItem(placement: .automatic) {
                 if jobBusy {
                     Button {
@@ -363,9 +397,23 @@ private struct RecordingDetailView: View {
         // this (or any — re-attribution uses "*") session finishes.
         .task(id: "\(item.id)|\(jobs.lastCompletedSessionID ?? "")") {
             let directory = item.directory
-            document = await Task.detached(priority: .userInitiated) {
-                RecordingsStore.loadDocument(from: directory)
+            let (doc, cleaned, stale) = await Task.detached(priority: .userInitiated) {
+                let doc = TranscriptDocument.load(from: directory)
+                let cleaned = TranscriptDocument.load(
+                    from: directory, filename: TranscriptDocument.cleanedFilename)
+                // Cleaned is stale if it was built from a different raw transcript.
+                let stale: Bool
+                if let doc, let cleaned {
+                    stale = cleaned.sourceHash != TranscriptDocument.contentHash(doc.utterances)
+                } else {
+                    stale = false
+                }
+                return (doc, cleaned, stale)
             }.value
+            document = doc
+            cleanedDocument = cleaned
+            cleanupStale = stale
+            if cleaned == nil { showCleaned = false }
             loaded = true
         }
     }
@@ -388,8 +436,33 @@ private struct RecordingDetailView: View {
     /// segment (click on its text) or a whole coalesced block (click on the
     /// label). Writes `.manual` provenance, which every automated pass must
     /// leave alone; one atomic persist for the whole group.
-    private func pin(_ ids: Set<UUID>, to speaker: SadiKit.Speaker) {
-        guard let doc = document, !jobBusy, !ids.isEmpty else { return }
+    @discardableResult
+    private func pin(_ ids: Set<UUID>, to speaker: SadiKit.Speaker) -> Task<Void, Never>? {
+        guard let doc = document, !jobBusy, !ids.isEmpty else { return nil }
+        guard let newDoc = Self.pinnedDocument(doc, ids: ids, to: speaker) else { return nil }
+        document = newDoc
+        let directory = item.directory
+        return Task(priority: .userInitiated) {
+            do {
+                // The coordinator re-applies the pin to the latest on-disk
+                // document; reflect the merged result back so memory matches
+                // what was persisted (disk may have moved under us).
+                if let merged = try await TranscriptDocumentFileCoordinator.shared.update(
+                    directory: directory,
+                    { latest in Self.pinnedDocument(latest, ids: ids, to: speaker) })
+                {
+                    document = merged
+                }
+            } catch {
+                // Disk write failed; the in-memory pin still shows. The next
+                // successful rewrite (another pin, a job) will retry the file.
+            }
+        }
+    }
+
+    nonisolated private static func pinnedDocument(
+        _ doc: TranscriptDocument, ids: Set<UUID>, to speaker: SadiKit.Speaker
+    ) -> TranscriptDocument? {
         var updated = doc.utterances
         var any = false
         for idx in updated.indices where ids.contains(updated[idx].id) {
@@ -397,23 +470,8 @@ private struct RecordingDetailView: View {
             updated[idx].assignmentKind = .manual
             any = true
         }
-        guard any else { return }
-        let newDoc = TranscriptDocument(
-            schemaVersion: 2,
-            sessionID: doc.sessionID,
-            generator: doc.generator,
-            utterances: updated
-        )
-        document = newDoc
-        let directory = item.directory
-        Task.detached(priority: .userInitiated) {
-            do {
-                try RecordingsStore.saveDocument(newDoc, to: directory)
-            } catch {
-                // Disk write failed; the in-memory pin still shows. The next
-                // successful rewrite (another pin, a job) will retry the file.
-            }
-        }
+        guard any else { return nil }
+        return doc.replacingUtterances(updated)
     }
 
     /// Enroll a brand-new speaker from a representative utterance's
@@ -422,8 +480,14 @@ private struct RecordingDetailView: View {
     private func enroll(name: String, from representative: Utterance, ids: Set<UUID>) {
         guard let embedding = representative.embedding else { return }
         guard let id = try? voiceprints.enroll(name: name, embedding: embedding) else { return }
-        pin(ids, to: .named(name, id))
-        jobs.enqueueReattribution()
+        if let pinSave = pin(ids, to: .named(name, id)) {
+            Task {
+                await pinSave.value
+                jobs.enqueueReattribution()
+            }
+        } else {
+            jobs.enqueueReattribution()
+        }
     }
 }
 

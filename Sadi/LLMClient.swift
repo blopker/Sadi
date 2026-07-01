@@ -68,11 +68,66 @@ final class LLMClient {
         return decoded.data.map(\.id).sorted()
     }
 
+    // MARK: - Chat completion
+
+    /// One-shot chat completion. `nonisolated` with `Sendable` inputs so the
+    /// offline pipeline can call it straight from its detached tasks without a
+    /// main-actor hop. Sends `chat_template_kwargs.enable_thinking=false` to
+    /// suppress reasoning on servers that honor it (omlx), and defensively
+    /// strips any `<think>…</think>` block that slips through on servers that
+    /// don't. Throws `LLMError`/`URLError` on failure for the caller to handle.
+    nonisolated static func complete(
+        config: LLMSettings.Config,
+        system: String,
+        user: String,
+        maxTokens: Int,
+        session: URLSession = .shared
+    ) async throws -> String {
+        var request = try makeRequest(config: config, path: "v1/chat/completions", timeout: 180)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload = ChatRequest(
+            model: config.model,
+            messages: [
+                .init(role: "system", content: system),
+                .init(role: "user", content: user),
+            ],
+            max_tokens: maxTokens,
+            temperature: 0.2,
+            chat_template_kwargs: ["enable_thinking": false]
+        )
+        request.httpBody = try JSONEncoder().encode(payload)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw LLMError.noResponse }
+        guard http.statusCode == 200 else {
+            throw LLMError.http(http.statusCode, serverMessage(data))
+        }
+        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
+        guard let content = decoded.choices.first?.message.content else { throw LLMError.noResponse }
+        return stripReasoning(content)
+    }
+
+    /// Remove any `<think>…</think>` reasoning block a server emits inline.
+    /// Each pass removes up to the first closing tag: from its matching open
+    /// tag when one precedes it, otherwise from the start of the text (the
+    /// open tag was consumed by the chat template).
+    nonisolated private static func stripReasoning(_ text: String) -> String {
+        var t = text
+        while let close = t.range(of: "</think>") {
+            if let open = t.range(of: "<think>"), open.lowerBound < close.lowerBound {
+                t.removeSubrange(open.lowerBound..<close.upperBound)
+            } else {
+                t.removeSubrange(t.startIndex..<close.upperBound)
+            }
+        }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - Request building
 
     /// Build a request against `{baseURL}/{path}` with the bearer key attached
-    /// when present. Shared by the model probe and (later) chat completions.
-    static func makeRequest(
+    /// when present. Shared by the model probe and chat completions.
+    nonisolated static func makeRequest(
         config: LLMSettings.Config, path: String, timeout: TimeInterval
     ) throws -> URLRequest {
         let trimmed = config.baseURL.trimmingCharacters(in: .whitespaces)
@@ -105,7 +160,7 @@ final class LLMClient {
     }
 
     /// Pull the human message out of an OpenAI-style `{"error":{"message":…}}`.
-    private static func serverMessage(_ data: Data) -> String? {
+    nonisolated private static func serverMessage(_ data: Data) -> String? {
         struct Envelope: Decodable {
             struct Payload: Decodable { let message: String }
             let error: Payload
@@ -134,4 +189,27 @@ enum LLMError: Error {
 private struct ModelsResponse: Decodable {
     struct Model: Decodable { let id: String }
     let data: [Model]
+}
+
+/// `/v1/chat/completions` request. Property names match the JSON keys (incl.
+/// `chat_template_kwargs`, an mlx/omlx extension to disable reasoning).
+private nonisolated struct ChatRequest: Encodable {
+    struct Message: Encodable {
+        let role: String
+        let content: String
+    }
+    let model: String
+    let messages: [Message]
+    let max_tokens: Int
+    let temperature: Double
+    let chat_template_kwargs: [String: Bool]
+}
+
+/// `/v1/chat/completions` response shape (only the fields we use).
+private nonisolated struct ChatResponse: Decodable {
+    struct Choice: Decodable {
+        struct Message: Decodable { let content: String }
+        let message: Message
+    }
+    let choices: [Choice]
 }

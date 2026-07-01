@@ -153,6 +153,7 @@ final class TranscriptionJobs {
                     sessionDirectory: dir,
                     modelHost: modelHost,
                     voiceprints: voiceprints,
+                    llmConfig: LLMSettings.currentIfConfigured(),
                     progress: { [weak self] phase in self?.active?.phase = phase }
                 )
                 lastError = nil
@@ -173,11 +174,8 @@ final class TranscriptionJobs {
             }
         case .reattribute:
             active?.phase = "Updating speaker names…"
-            let prints = voiceprints.prints
-            let threshold = voiceprints.matchThreshold
-            let changed = await Task.detached(priority: .utility) {
-                Self.reattribute(prints: prints, threshold: threshold)
-            }.value
+            let changed = await Self.reattribute(
+                prints: voiceprints.prints, threshold: voiceprints.matchThreshold)
             if changed > 0 {
                 Self.log.notice("Re-attribution updated \(changed) utterances")
                 // Any open detail view should reload; reuse the completion
@@ -210,69 +208,88 @@ final class TranscriptionJobs {
         return pending.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// Re-match saved transcripts against the book. Only non-manual
-    /// utterances with embeddings move; nothing is ever un-named (no match →
-    /// label kept). Returns the number of utterances updated.
-    nonisolated private static func reattribute(prints: [Voiceprint], threshold: Float) -> Int {
+    // MARK: - Re-attribution
+
+    /// Re-match saved transcripts against the book — `@concurrent` so the
+    /// directory scan stays off the main actor. Only non-manual utterances
+    /// with embeddings move; nothing is ever un-named (no match → label
+    /// kept). Each document rewrite goes through the file coordinator so it
+    /// cannot race a manual pin. Returns the number of utterances updated.
+    @concurrent
+    nonisolated private static func reattribute(prints: [Voiceprint], threshold: Float) async -> Int {
         guard !prints.isEmpty, let root = try? SessionPaths.recordingsRoot() else { return 0 }
-        let fm = FileManager.default
-        guard let dirs = try? fm.contentsOfDirectory(
+        guard let dirs = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         else { return 0 }
 
         var totalChanged = 0
         for dir in dirs {
-            guard var doc = RecordingsStore.loadDocument(from: dir) else { continue }
-            var changed = false
-            var utterances = doc.utterances
-
-            func bestMatch(for embedding: [Float]) -> Voiceprint? {
-                var best: (vp: Voiceprint, d: Float)?
-                for vp in prints
-                where vp.modelVersion == ModelHost.embeddingModelVersion
-                    && vp.embedding.count == embedding.count {
-                    let d = VoiceprintBook.cosineDistance(embedding, vp.embedding)
-                    if d < (best?.d ?? .infinity) { best = (vp, d) }
+            do {
+                if let (_, changed) = try await TranscriptDocumentFileCoordinator.shared.update(
+                    directory: dir,
+                    { doc -> (TranscriptDocument, Int)? in
+                        let result = reattributed(
+                            doc.utterances, prints: prints, threshold: threshold)
+                        guard result.changed > 0 else { return nil }
+                        return (doc.replacingUtterances(result.utterances), result.changed)
+                    })
+                {
+                    totalChanged += changed
                 }
-                guard let best, best.d < threshold else { return nil }
-                return best.vp
-            }
-
-            // System rows first, so the mic pass below can apply the
-            // cross-track sanity guard against final system labels.
-            for pass in 0...1 {
-                let source: Source = pass == 0 ? .system : .mic
-                let systemUtterances =
-                    pass == 0 ? [] : utterances.filter { $0.source == .system }
-                for i in utterances.indices where utterances[i].source == source {
-                    let u = utterances[i]
-                    guard u.assignmentKind != .manual, let embedding = u.embedding,
-                          let match = bestMatch(for: embedding)
-                    else { continue }
-                    // A mic row matching a far-end identity without system
-                    // overlap is a mis-match, not bleed — leave it alone
-                    // rather than renaming the local user (SpeakerSanity).
-                    if source == .mic,
-                       SpeakerSanity.isImplausibleMicMatch(
-                           u, voiceprintID: match.id, systemUtterances: systemUtterances) {
-                        continue
-                    }
-                    let newSpeaker = Speaker.named(match.name, match.id)
-                    if u.speaker != newSpeaker || u.assignmentKind != .matched {
-                        utterances[i].speaker = newSpeaker
-                        utterances[i].assignmentKind = .matched
-                        changed = true
-                        totalChanged += 1
-                    }
-                }
-            }
-            if changed {
-                doc = TranscriptDocument(
-                    schemaVersion: 2, sessionID: doc.sessionID,
-                    generator: doc.generator, utterances: utterances)
-                try? RecordingsStore.saveDocument(doc, to: dir)
+            } catch {
+                // Preserve the previous file on write failure; the next
+                // re-attribution pass can retry from the same source document.
             }
         }
         return totalChanged
+    }
+
+    /// Pure re-matching pass over one document's utterances. System rows
+    /// first, so the mic pass can apply the cross-track sanity guard against
+    /// final system labels. Returns the rewritten rows and how many changed.
+    nonisolated private static func reattributed(
+        _ original: [Utterance], prints: [Voiceprint], threshold: Float
+    ) -> (utterances: [Utterance], changed: Int) {
+        var utterances = original
+        var changed = 0
+
+        func bestMatch(for embedding: [Float]) -> Voiceprint? {
+            var best: (vp: Voiceprint, d: Float)?
+            for vp in prints
+            where vp.modelVersion == ModelHost.embeddingModelVersion
+                && vp.embedding.count == embedding.count {
+                let d = VoiceprintBook.cosineDistance(embedding, vp.embedding)
+                if d < (best?.d ?? .infinity) { best = (vp, d) }
+            }
+            guard let best, best.d < threshold else { return nil }
+            return best.vp
+        }
+
+        for pass in 0...1 {
+            let source: Source = pass == 0 ? .system : .mic
+            let systemUtterances =
+                pass == 0 ? [] : utterances.filter { $0.source == .system }
+            for i in utterances.indices where utterances[i].source == source {
+                let u = utterances[i]
+                guard u.assignmentKind != .manual, let embedding = u.embedding,
+                      let match = bestMatch(for: embedding)
+                else { continue }
+                // A mic row matching a far-end identity without system
+                // overlap is a mis-match, not bleed; leave it alone rather
+                // than renaming the local user (SpeakerSanity).
+                if source == .mic,
+                   SpeakerSanity.isImplausibleMicMatch(
+                       u, voiceprintID: match.id, systemUtterances: systemUtterances) {
+                    continue
+                }
+                let newSpeaker = Speaker.named(match.name, match.id)
+                if u.speaker != newSpeaker || u.assignmentKind != .matched {
+                    utterances[i].speaker = newSpeaker
+                    utterances[i].assignmentKind = .matched
+                    changed += 1
+                }
+            }
+        }
+        return (utterances, changed)
     }
 }
