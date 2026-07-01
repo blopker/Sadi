@@ -81,6 +81,7 @@ final class LLMClient {
         system: String,
         user: String,
         maxTokens: Int,
+        temperature: Double = 0.2,
         session: URLSession = .shared
     ) async throws -> String {
         var request = try makeRequest(config: config, path: "v1/chat/completions", timeout: 180)
@@ -93,7 +94,7 @@ final class LLMClient {
                 .init(role: "user", content: user),
             ],
             max_tokens: maxTokens,
-            temperature: 0.2,
+            temperature: temperature,
             chat_template_kwargs: ["enable_thinking": false]
         )
         request.httpBody = try JSONEncoder().encode(payload)
