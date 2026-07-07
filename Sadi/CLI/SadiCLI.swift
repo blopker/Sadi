@@ -26,6 +26,9 @@ enum SadiCLI {
             case .offline(let mode, let session):
                 try await offline(mode: mode, session: session)
                 return 0
+            case .micTest(let seconds):
+                try await micTest(seconds: seconds)
+                return 0
             }
         } catch let error as CLIError {
             stderr("error: \(error.message)")
@@ -49,11 +52,20 @@ enum SadiCLI {
         case help
         case replay(ReplayOptions)
         case offline(OfflinePipeline.Mode, String?)
+        case micTest(seconds: Double)
     }
 
     static func parse(_ args: [String]) throws -> Command {
         if args.isEmpty || args.contains("-h") || args.contains("--help") {
             return .help
+        }
+        if args[0] == "mic" {
+            guard args.count <= 2 else { throw CLIError("unexpected extra argument.") }
+            let seconds = args.count == 2 ? Double(args[1]) : 10
+            guard let seconds, seconds > 0, seconds <= 120 else {
+                throw CLIError("seconds must be a number in (0, 120].")
+            }
+            return .micTest(seconds: seconds)
         }
         if args[0] == "finalize" || args[0] == "rerun" {
             let mode: OfflinePipeline.Mode = args[0] == "finalize" ? .finalize : .rerun
@@ -214,6 +226,60 @@ enum SadiCLI {
         """)
     }
 
+    // MARK: - Mic test
+
+    /// Sandboxed end-to-end check of the live mic path: MicCapture (VPIO +
+    /// AEC) → resample → Apple ASR. Prints level stats and the transcript.
+    /// Diagnostic for exactly the failure modes App Sandbox can introduce
+    /// around VoiceProcessingIO (mach-lookup denials, silent capture).
+    static func micTest(seconds: Double) async throws {
+        stderr("Recording \(seconds)s from the mic (VPIO voice processing on)…")
+        let mic = try MicCapture()
+        stderr("  client rate: \(Int(mic.sampleRate)) Hz")
+        try mic.start()
+
+        var samples: [Float] = []
+        var buf = [Float](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            let avail = mic.ring.availableToRead
+            if avail >= 1024 {
+                let n = min(avail, buf.count)
+                let ok = buf.withUnsafeMutableBufferPointer { mic.ring.pull(count: n, into: $0) }
+                if ok { samples.append(contentsOf: buf[0..<n]) }
+            } else {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        mic.stop()
+
+        var sumSq: Float = 0
+        var peak: Float = 0
+        for v in samples {
+            sumSq += v * v
+            peak = max(peak, abs(v))
+        }
+        let rms = samples.isEmpty ? 0 : (sumSq / Float(samples.count)).squareRoot()
+        print(String(
+            format: "captured %.1f s, rms=%.5f, peak=%.5f, dropped=%d",
+            Double(samples.count) / mic.sampleRate, rms, peak, mic.droppedFrames))
+        guard !samples.isEmpty else { throw CLIError("no samples captured (mic permission?)") }
+
+        stderr("Transcribing…")
+        let asr = try await AppleAsr.load()
+        var resampler = try Resampler(sourceRate: mic.sampleRate, maxInputFrames: 2048)
+        var samples16k: [Float] = []
+        var i = 0
+        while i < samples.count {
+            let chunk = Array(samples[i..<min(i + 2048, samples.count)])
+            let out = try chunk.withUnsafeBufferPointer { try resampler.resample($0) }
+            samples16k.append(contentsOf: out)
+            i += 2048
+        }
+        let result = try await asr.transcribe(samples16k)
+        print("transcript: \(result.text.isEmpty ? "(empty)" : result.text)")
+    }
+
     // MARK: - Session resolution
 
     static func selectedTracks(_ selection: TrackSelection, sessionDir: URL) -> [(Source, URL)] {
@@ -315,6 +381,7 @@ enum SadiCLI {
       Sadi cli replay [OPTIONS] [SESSION]
       Sadi cli finalize [SESSION]
       Sadi cli rerun [SESSION]
+      Sadi cli mic [SECONDS]
 
     COMMANDS:
       replay         Re-drive the live streaming pipeline from the session's
@@ -324,6 +391,9 @@ enum SadiCLI {
                      and echo filtering. WRITES transcript.json/session.json.
       rerun          Full regeneration from audio: offline VAD + batch ASR +
                      the finalize tail. WRITES transcript.json/session.json.
+      mic            Diagnostic: record SECONDS (default 10) from the live
+                     MicCapture (VPIO echo cancellation on), print level
+                     stats and the ASR transcript. Nothing written to disk.
 
     ARGS:
       SESSION        Session id (e.g. 2026-05-28-14-03-09) or a path to a

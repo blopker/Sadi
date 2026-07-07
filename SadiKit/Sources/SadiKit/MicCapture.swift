@@ -4,25 +4,30 @@ import Foundation
 import OSLog
 import Synchronization
 
-/// Microphone capture per SPEC §5.1.
+/// Microphone capture per SPEC §5.1, with the OS echo canceller in-line.
 ///
-/// Uses a raw **AUHAL input unit** (`kAudioUnitSubType_HALOutput`, input-enabled)
-/// rather than `AVAudioEngine`. On macOS `AVAudioEngine` silently builds a hidden
-/// input+output *aggregate* device the moment you touch it and can only address
-/// one device for both directions — which forces Bluetooth headsets into their
-/// low-quality full-duplex (HFP) mode and produces "config change pending" /
-/// `kAudioUnitErr_InvalidElement` storms on any device change. An AUHAL unit sits
-/// directly on a single `AudioDevice` with no aggregate and no graph, so
-/// following the system default mic is just an `kAudioOutputUnitProperty_CurrentDevice`
-/// set on the live unit — no rebuild, no feedback loop, and it survives hardware
-/// vanishing mid-stream (Apple TN2091; this is what robust capture apps use).
+/// Uses a raw **VoiceProcessingIO unit** (`kAudioUnitSubType_VoiceProcessingIO`)
+/// rather than `AVAudioEngine`: the raw unit lets us bind the input (element 1)
+/// and output (element 0) devices explicitly and follow device changes with a
+/// plain `kAudioOutputUnitProperty_CurrentDevice` set — no hidden aggregate, no
+/// graph rebuild storms (the reasons the previous AUHAL implementation avoided
+/// AVAudioEngine still apply).
 ///
-/// The realtime input callback renders into a pre-allocated buffer list, extracts
-/// channel 0 (averaging multi-mic arrays destroys the voice signal on MacBook
-/// built-ins), back-fills any host-time gap with silence (so the ring's sample
-/// count stays locked to wall-clock for echo alignment), and pushes into the SPSC
-/// ring. Everything else — resampling, file writing, VAD, ASR — runs on a
-/// normal-priority consumer that pulls from the ring.
+/// VPIO applies Apple's AEC + noise suppression to the mic stream, using
+/// *everything played to the bound output device* — including other apps like
+/// Zoom/Meet — as the echo reference. Far-end audio bleeding from the speakers
+/// into the mic is removed at capture time, so the archive, ASR, and voiceprint
+/// stages all see echo-suppressed audio; the text-level `EchoFilter` remains as
+/// a backstop. The output element must stay enabled (it IS the reference tap);
+/// we render silence to it. AGC is disabled (honest archive levels) and
+/// other-audio ducking is pinned to minimum so the user's call volume is not
+/// ducked. Verified recipe: scratch/speech-compare/vpio_probe.swift.
+///
+/// The realtime input callback renders the processed (mono) mic signal into a
+/// pre-allocated buffer list, back-fills any host-time gap with silence (so the
+/// ring's sample count stays locked to wall-clock for echo alignment), and
+/// pushes into the SPSC ring. Everything else — resampling, file writing, VAD,
+/// ASR — runs on a normal-priority consumer that pulls from the ring.
 public final class MicCapture: @unchecked Sendable {
     public enum Error: Swift.Error {
         case noInputDevice
@@ -73,11 +78,16 @@ public final class MicCapture: @unchecked Sendable {
     private let isRunningAtomic = Atomic<Bool>(false)
 
     /// Serializes device-follow against itself; also the queue the CoreAudio
-    /// default-input listener fires on.
+    /// default-device listeners fire on.
     private let reconfigQueue = DispatchQueue(label: "io.kbl.sadi.miccapture.reconfig")
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
-    /// Device the unit is currently bound to.
+    private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    /// Input device the unit is currently bound to (element 1).
     private var boundDeviceID: AudioDeviceID = 0
+    /// Output device the unit is currently bound to (element 0) — the AEC
+    /// reference. Follows the default output so cancellation tracks wherever
+    /// the far-end audio is actually playing.
+    private var boundOutputDeviceID: AudioDeviceID = 0
     private var reconcileGeneration = 0
     /// Quiet window for the device-follow debounce — long enough to ride out a
     /// Bluetooth A2DP→HFP profile flap so we switch once, to the settled device.
@@ -128,7 +138,10 @@ public final class MicCapture: @unchecked Sendable {
         let unit = try makeInputUnit()
         self.unit = unit
 
-        try bringUp(unit, device: MicCapture.preferredInputDevice())
+        try bringUp(
+            unit,
+            device: MicCapture.preferredInputDevice(),
+            output: MicCapture.preferredOutputDevice())
 
         isRunningAtomic.store(true, ordering: .releasing)
         registerDeviceChangeListener()
@@ -167,14 +180,16 @@ public final class MicCapture: @unchecked Sendable {
         freeRenderBuffers()
     }
 
-    // MARK: - AUHAL setup
+    // MARK: - VPIO setup
 
-    /// Create the HAL output unit, enable input / disable output, and install the
-    /// input callback. Device + format are set later in `configure(_:forDevice:)`.
+    /// Create the VoiceProcessingIO unit, enable input (element 1) *and* output
+    /// (element 0 — required: the output stream is the AEC reference), install
+    /// the input callback and a silence render callback, and set the voice-
+    /// processing knobs. Devices + formats are set later in `configure`.
     private func makeInputUnit() throws -> AudioUnit {
         var acd = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
+            componentSubType: kAudioUnitSubType_VoiceProcessingIO,
             componentManufacturer: kAudioUnitManufacturer_Apple,
             componentFlags: 0,
             componentFlagsMask: 0
@@ -186,10 +201,10 @@ public final class MicCapture: @unchecked Sendable {
         let s = AudioComponentInstanceNew(component, &unit)
         guard s == noErr, let unit else { throw Error.unitCreationFailed(s) }
 
-        // Enable input (element 1), disable output (element 0). Order matters:
-        // the device can only be set after IO is enabled.
+        // Enable input (element 1) and output (element 0). Order matters:
+        // devices can only be set after IO is enabled.
         if MicCapture.set(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, UInt32(1)) != noErr
-            || MicCapture.set(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, UInt32(0)) != noErr {
+            || MicCapture.set(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, UInt32(1)) != noErr {
             AudioComponentInstanceDispose(unit)
             throw Error.configurationFailed(-1)
         }
@@ -198,6 +213,25 @@ public final class MicCapture: @unchecked Sendable {
         _ = MicCapture.set(
             unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
             UInt32(MicCapture.maxRenderFrames))
+
+        // AGC off: the recorded level should be what the mic heard, not a
+        // pumped chat level. (AEC + noise suppression stay on — they're the
+        // point.) Best-effort: absence of AGC is not worth failing capture.
+        _ = MicCapture.set(
+            unit, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, UInt32(0))
+
+        // Never duck other apps' audio: the "other audio" here is the call the
+        // user is listening to. Default config ducks it for voice chat.
+        var ducking = AUVoiceIOOtherAudioDuckingConfiguration(
+            mEnableAdvancedDucking: false,
+            mDuckingLevel: .min
+        )
+        let duckStatus = AudioUnitSetProperty(
+            unit, kAUVoiceIOProperty_OtherAudioDuckingConfiguration, kAudioUnitScope_Global, 0,
+            &ducking, UInt32(MemoryLayout<AUVoiceIOOtherAudioDuckingConfiguration>.size))
+        if duckStatus != noErr {
+            Self.log.error("Ducking config failed: \(duckStatus, privacy: .public) — other audio may duck")
+        }
 
         var cb = AURenderCallbackStruct(
             inputProc: MicCapture.inputProc,
@@ -210,29 +244,52 @@ public final class MicCapture: @unchecked Sendable {
             AudioComponentInstanceDispose(unit)
             throw Error.configurationFailed(cbStatus)
         }
+
+        // Output element renders silence — it exists purely so the unit can
+        // tap the output device as its echo reference.
+        var renderCB = AURenderCallbackStruct(
+            inputProc: MicCapture.silenceProc,
+            inputProcRefCon: nil
+        )
+        let renderStatus = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
+            &renderCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        guard renderStatus == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw Error.configurationFailed(renderStatus)
+        }
         return unit
     }
 
-    /// Point the unit at `device`, read that device's native input channel count,
-    /// set our client format (Float32, non-interleaved, fixed `sampleRate`) and
-    /// (re)allocate the render buffer list. Must run while the unit is
-    /// uninitialized (start, or stopped+uninitialized during a switch).
-    private func configure(_ unit: AudioUnit, forDevice device: AudioDeviceID) throws {
+    /// Bind the input device (element 1) and the AEC-reference output device
+    /// (element 0), set our client formats (Float32 mono, fixed `sampleRate` —
+    /// VPIO's processed voice output is mono; its converters bridge whatever
+    /// the devices run at), and (re)allocate the render buffer list. Must run
+    /// while the unit is uninitialized (start, or stopped+uninitialized during
+    /// a switch).
+    private func configure(
+        _ unit: AudioUnit, forDevice device: AudioDeviceID, outputDevice: AudioDeviceID
+    ) throws {
         if device != 0 {
-            let s = MicCapture.set(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, device)
+            var dev = device
+            let s = AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 1,
+                &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
             guard s == noErr else { throw Error.configurationFailed(s) }
         }
         boundDeviceID = device
+        if outputDevice != 0 {
+            var dev = outputDevice
+            let s = AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard s == noErr else { throw Error.configurationFailed(s) }
+        }
+        boundOutputDeviceID = outputDevice
 
-        // Device's native input format lives on the input scope of element 1.
-        var deviceFormat = AudioStreamBasicDescription()
-        var dfSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        _ = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &deviceFormat, &dfSize)
-        let channels = max(1, Int(deviceFormat.mChannelsPerFrame))
-
-        // Our desired output of the input bus: Float32, deinterleaved (so channel
-        // 0 is its own buffer), at the fixed client rate. The AUHAL inserts an
-        // AudioConverter to bridge device format → this.
+        // Processed mic out of the input bus: Float32 mono at the fixed client
+        // rate. (No per-channel handling: VPIO consumes the device's mic array
+        // itself and emits one processed voice channel.)
         var client = AudioStreamBasicDescription(
             mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
@@ -240,7 +297,7 @@ public final class MicCapture: @unchecked Sendable {
             mBytesPerPacket: 4,
             mFramesPerPacket: 1,
             mBytesPerFrame: 4,
-            mChannelsPerFrame: UInt32(channels),
+            mChannelsPerFrame: 1,
             mBitsPerChannel: 32,
             mReserved: 0
         )
@@ -249,7 +306,14 @@ public final class MicCapture: @unchecked Sendable {
             &client, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
         guard fmtStatus == noErr else { throw Error.configurationFailed(fmtStatus) }
 
-        allocateRenderBuffers(channels: channels)
+        // Format of the silence we feed the output element.
+        var silenceFormat = client
+        let silStatus = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
+            &silenceFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        guard silStatus == noErr else { throw Error.configurationFailed(silStatus) }
+
+        allocateRenderBuffers(channels: 1)
     }
 
     // MARK: - Realtime input callback
@@ -259,6 +323,20 @@ public final class MicCapture: @unchecked Sendable {
     private static let inputProc: AURenderCallback = { refCon, flags, timestamp, _, frames, _ in
         Unmanaged<MicCapture>.fromOpaque(refCon).takeUnretainedValue()
             .render(flags: flags, timestamp: timestamp, frames: frames)
+    }
+
+    /// Render callback for the output element: zero-fill. The element only
+    /// exists so VPIO can tap the output device as its echo reference; we
+    /// never play anything.
+    private static let silenceProc: AURenderCallback = { _, flags, _, _, _, ioData in
+        if let ioData {
+            let list = UnsafeMutableAudioBufferListPointer(ioData)
+            for i in 0..<list.count {
+                if let d = list[i].mData { memset(d, 0, Int(list[i].mDataByteSize)) }
+            }
+        }
+        flags.pointee.insert(.unitRenderAction_OutputIsSilence)
+        return noErr
     }
 
     private func render(
@@ -349,25 +427,47 @@ public final class MicCapture: @unchecked Sendable {
     // MARK: - Device following
 
     private func registerDeviceChangeListener() {
-        var addr = MicCapture.defaultInputAddress
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        var inAddr = MicCapture.defaultInputAddress
+        let inBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.scheduleReconcile()  // already on reconfigQueue
         }
-        let status = AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block)
-        if status == noErr {
-            defaultInputListener = block
+        let inStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &inAddr, reconfigQueue, inBlock)
+        if inStatus == noErr {
+            defaultInputListener = inBlock
         } else {
-            Self.log.error("Add default-input listener failed: \(status, privacy: .public)")
+            Self.log.error("Add default-input listener failed: \(inStatus, privacy: .public)")
+        }
+
+        // Also follow the default *output*: it's the AEC reference. If the user
+        // moves call audio to another device mid-recording, cancellation has to
+        // move with it.
+        var outAddr = MicCapture.defaultOutputAddress
+        let outBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleReconcile()
+        }
+        let outStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &outAddr, reconfigQueue, outBlock)
+        if outStatus == noErr {
+            defaultOutputListener = outBlock
+        } else {
+            Self.log.error("Add default-output listener failed: \(outStatus, privacy: .public)")
         }
     }
 
     private func removeDeviceChangeListener() {
-        guard let block = defaultInputListener else { return }
-        var addr = MicCapture.defaultInputAddress
-        AudioObjectRemovePropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block)
-        defaultInputListener = nil
+        if let block = defaultInputListener {
+            var addr = MicCapture.defaultInputAddress
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block)
+            defaultInputListener = nil
+        }
+        if let block = defaultOutputListener {
+            var addr = MicCapture.defaultOutputAddress
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, reconfigQueue, block)
+            defaultOutputListener = nil
+        }
     }
 
     private func scheduleReconcile() {
@@ -383,58 +483,72 @@ public final class MicCapture: @unchecked Sendable {
         }
     }
 
-    /// Follow the system default input. Runs on `reconfigQueue`. No-op unless the
-    /// default actually changed. Switching is a `CurrentDevice` set on the *live*
-    /// unit (stop → uninitialize → reconfigure → initialize → start) — no engine,
-    /// no aggregate, no graph reconfiguration, so no -10877 storm and no feedback
-    /// loop (we change *our* unit, not the system default).
+    /// Follow the system default input and output. Runs on `reconfigQueue`.
+    /// No-op unless a bound device actually needs to change. Switching is a
+    /// `CurrentDevice` set on the *live* unit (stop → uninitialize →
+    /// reconfigure → initialize → start) — no engine, no aggregate, no graph
+    /// reconfiguration, so no -10877 storm and no feedback loop (we change
+    /// *our* unit, not the system default).
     private func reconcile() {
         guard isRunningAtomic.load(ordering: .acquiring), let unit else { return }
-        let current = (try? MicCapture.defaultInputDevice()) ?? 0
-        guard current != 0, current != boundDeviceID else { return }
-        // Don't follow the mic onto a Bluetooth input. Activating an AirPods-style
-        // HFP mic forces the whole device to low-quality full-duplex AND conflicts
-        // with our system-audio output tap (the IO won't even start). The leading
-        // meeting apps avoid this the same way: keep a built-in/wired mic and let
-        // the system-audio tap capture the remote side. Stay on the current mic.
-        guard !MicCapture.deviceIsBluetooth(current) else {
-            Self.log.notice(
-                "Default input \(current, privacy: .public) is Bluetooth; keeping current mic (HFP would conflict with system-audio capture)")
-            return
-        }
-        guard MicCapture.deviceIsLiveInput(current) else {
-            Self.log.notice("New default input \(current, privacy: .public) not a live input yet; deferring")
-            return
+
+        // Desired input: the system default — unless it's Bluetooth (an
+        // AirPods-style HFP mic forces the whole device to low-quality
+        // full-duplex AND conflicts with our system-audio output tap; the
+        // leading meeting apps also refuse it) or not yet a live input
+        // (mid-creation during a profile transition).
+        var targetInput = boundDeviceID
+        let currentDefault = (try? MicCapture.defaultInputDevice()) ?? 0
+        if currentDefault != 0, currentDefault != boundDeviceID {
+            if MicCapture.deviceIsBluetooth(currentDefault) {
+                Self.log.notice(
+                    "Default input \(currentDefault, privacy: .public) is Bluetooth; keeping current mic (HFP would conflict with system-audio capture)")
+            } else if !MicCapture.deviceIsLiveInput(currentDefault) {
+                Self.log.notice(
+                    "New default input \(currentDefault, privacy: .public) not a live input yet; deferring")
+            } else {
+                targetInput = currentDefault
+            }
         }
 
-        let previous = boundDeviceID
-        Self.log.notice("Default input changed (\(previous) → \(current)); switching mic device")
+        // Desired AEC reference: the (non-BT-preferred) default output.
+        let targetOutput = MicCapture.preferredOutputDevice()
+
+        guard targetInput != boundDeviceID
+            || (targetOutput != 0 && targetOutput != boundOutputDeviceID)
+        else { return }
+
+        let previousInput = boundDeviceID
+        let previousOutput = boundOutputDeviceID
+        Self.log.notice(
+            "Device follow: mic \(previousInput) → \(targetInput), AEC reference \(previousOutput) → \(targetOutput)")
         AudioOutputUnitStop(unit)
         AudioUnitUninitialize(unit)
         do {
-            try bringUp(unit, device: current)
+            try bringUp(unit, device: targetInput, output: targetOutput)
         } catch {
-            // The new device wouldn't start (commonly a Bluetooth input mid-HFP
-            // negotiation: StartIO returns 'nope'/ETIMEDOUT). Don't go dead —
-            // restore the device we were just successfully recording from so
-            // capture continues. We'll follow again on the next change.
+            // The new pair wouldn't start (commonly a device mid-transition:
+            // StartIO returns 'nope'/ETIMEDOUT). Don't go dead — restore the
+            // pair we were just successfully recording from so capture
+            // continues. We'll follow again on the next change.
             Self.log.error(
-                "Mic switch to \(current, privacy: .public) failed (\(String(describing: error), privacy: .public)); restoring \(previous, privacy: .public)")
-            if previous != 0, previous != current {
-                do { try bringUp(unit, device: previous) } catch {
-                    Self.log.error("Mic restore to \(previous, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                "Mic switch to (\(targetInput, privacy: .public), \(targetOutput, privacy: .public)) failed (\(String(describing: error), privacy: .public)); restoring (\(previousInput, privacy: .public), \(previousOutput, privacy: .public))")
+            if previousInput != 0, (previousInput, previousOutput) != (targetInput, targetOutput) {
+                do { try bringUp(unit, device: previousInput, output: previousOutput) } catch {
+                    Self.log.error(
+                        "Mic restore to (\(previousInput, privacy: .public), \(previousOutput, privacy: .public)) failed: \(String(describing: error), privacy: .public)")
                 }
             }
         }
     }
 
-    /// Configure the unit for `device`, initialize, and start — once. Throws on
-    /// any failure, leaving the unit uninitialized so the caller can recover.
-    /// One-shot by design: `AudioOutputUnitStart` blocks ~1 s on a not-ready
-    /// device, so retrying in a loop would jam the serial queue for seconds and
-    /// stall teardown.
-    private func bringUp(_ unit: AudioUnit, device: AudioDeviceID) throws {
-        try configure(unit, forDevice: device)
+    /// Configure the unit for the device pair, initialize, and start — once.
+    /// Throws on any failure, leaving the unit uninitialized so the caller can
+    /// recover. One-shot by design: `AudioOutputUnitStart` blocks ~1 s on a
+    /// not-ready device, so retrying in a loop would jam the serial queue for
+    /// seconds and stall teardown.
+    private func bringUp(_ unit: AudioUnit, device: AudioDeviceID, output: AudioDeviceID) throws {
+        try configure(unit, forDevice: device, outputDevice: output)
         let s1 = AudioUnitInitialize(unit)
         guard s1 == noErr else { throw Error.configurationFailed(s1) }
         let s2 = AudioOutputUnitStart(unit)
@@ -471,6 +585,14 @@ public final class MicCapture: @unchecked Sendable {
         )
     }
 
+    private static var defaultOutputAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
     private static func defaultInputDevice() throws -> AudioDeviceID {
         var deviceID = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -479,6 +601,15 @@ public final class MicCapture: @unchecked Sendable {
             AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID)
         guard status == noErr, deviceID != 0 else { throw Error.noInputDevice }
         return deviceID
+    }
+
+    private static func defaultOutputDevice() -> AudioDeviceID {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = defaultOutputAddress
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID)
+        return status == noErr ? deviceID : 0
     }
 
     /// True when `id` is a live device with at least one input stream. Guards
@@ -548,6 +679,44 @@ public final class MicCapture: @unchecked Sendable {
             return nonBT
         }
         return (try? defaultInputDevice()) ?? 0
+    }
+
+    /// The AEC-reference output device to bind. Prefers the system default
+    /// output — unless it's Bluetooth: binding VPIO's output element to an
+    /// A2DP device risks forcing it into low-quality HFP, and headphones mean
+    /// there's no speaker→mic bleed to cancel anyway. Fall back to a non-BT
+    /// output (built-in speakers), where the reference is simply quiet.
+    private static func preferredOutputDevice() -> AudioDeviceID {
+        let def = defaultOutputDevice()
+        if def != 0, !deviceIsBluetooth(def) {
+            return def
+        }
+        if let nonBT = allOutputDevices().first(where: { !deviceIsBluetooth($0) }) {
+            return nonBT
+        }
+        return def
+    }
+
+    /// All devices with at least one output stream.
+    private static func allOutputDevices() -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let sysObj = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(sysObj, &addr, 0, nil, &size) == noErr else { return [] }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.filter { id in
+            var sAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain)
+            var sSize: UInt32 = 0
+            return AudioObjectGetPropertyDataSize(id, &sAddr, 0, nil, &sSize) == noErr && sSize > 0
+        }
     }
 
     private static func nominalSampleRate(of device: AudioDeviceID) throws -> Double {
