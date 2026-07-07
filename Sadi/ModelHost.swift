@@ -14,9 +14,10 @@ extension LSEENDModel: @unchecked @retroactive Sendable {}
 // post-init; safe to mark @unchecked Sendable.
 extension DiarizerManager: @unchecked @retroactive Sendable {}
 
-/// Single point of truth for the FluidAudio models. Loads Silero VAD and
-/// Parakeet TDT v2 once at app start; both stream processors share the loaded
-/// weights (their decoder state is per-segment, not per-instance).
+/// Single point of truth for the speech models. Loads Silero VAD, the Apple
+/// SpeechTranscriber ASR engine, and the FluidAudio diarizers once at app
+/// start; both stream processors share them (ASR/decoder state is
+/// per-segment, not per-instance).
 @Observable
 @MainActor
 final class ModelHost {
@@ -29,7 +30,7 @@ final class ModelHost {
 
     private(set) var state: LoadState = .idle
     private(set) var vad: VadManager?
-    private(set) var asrModels: AsrModels?
+    private(set) var asr: AppleAsr?
     private(set) var diarizerModel: LSEENDModel?
     private(set) var embeddingDiarizer: DiarizerManager?
     /// Offline (batch) diarization model set — loaded lazily on the first
@@ -46,18 +47,24 @@ final class ModelHost {
 
     nonisolated private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "models")
 
-    /// Whether every model folder `loadIfNeeded()` needs is already on disk.
-    /// The CLI uses this to fail fast instead of silently kicking off a
-    /// (potentially large) HuggingFace download in a headless run.
-    nonisolated static func modelsPresent() -> Bool {
+    /// Whether every model `loadIfNeeded()` needs is already on disk — the
+    /// FluidAudio folders plus the OS speech assets for our locale. The CLI
+    /// uses this to fail fast instead of silently kicking off a (potentially
+    /// large) download in a headless run.
+    nonisolated static func modelsPresent() async -> Bool {
+        // `AsrModels.defaultCacheDirectory` is used purely as a path anchor
+        // for the FluidAudio cache root; the Parakeet ASR models themselves
+        // are no longer downloaded.
         let root = AsrModels.defaultCacheDirectory(for: .v2).deletingLastPathComponent()
-        let required = ["parakeet-tdt-0.6b-v2", "ls-eend", "silero-vad", "speaker-diarization"]
+        let required = ["ls-eend", "silero-vad", "speaker-diarization"]
         let fm = FileManager.default
-        return required.allSatisfy { name in
+        let fluidPresent = required.allSatisfy { name in
             var isDir: ObjCBool = false
             let path = root.appending(path: name, directoryHint: .isDirectory).path(percentEncoded: false)
             return fm.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
         }
+        guard fluidPresent else { return false }
+        return await AppleAsr.assetsInstalled()
     }
 
     /// Load (downloading on first use) the offline diarizer models. Memoized;
@@ -90,29 +97,19 @@ final class ModelHost {
             // VAD: small (~20 MB), loads fast. Get it up first.
             let vad = try await VadManager()
             self.vad = vad
-            state = .loading(fraction: 0.05, phase: "Downloading Parakeet TDT v2")
+            state = .loading(fraction: 0.05, phase: "Preparing speech model")
 
-            // Parakeet TDT v2: SPEC §6.3 calls this version explicitly.
-            // Default location is ~/Library/Application Support/FluidAudio/Models
-            // under the sandbox container.
-            let dir = AsrModels.defaultCacheDirectory(for: .v2)
-            try FileManager.default.createDirectory(
-                at: dir.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let models = try await AsrModels.load(
-                from: dir,
-                version: .v2,
-                progressHandler: { progress in
-                    Task { @MainActor [weak self] in
-                        self?.state = .loading(
-                            fraction: 0.05 + 0.95 * progress.fractionCompleted,
-                            phase: "Parakeet: \(progress.phase)"
-                        )
-                    }
+            // Apple SpeechTranscriber: the OS ships the model; first run may
+            // download the locale's assets (system-managed, shared).
+            let asr = try await AppleAsr.load { fraction, phase in
+                Task { @MainActor [weak self] in
+                    self?.state = .loading(
+                        fraction: 0.05 + 0.9 * fraction,
+                        phase: phase
+                    )
                 }
-            )
-            self.asrModels = models
+            }
+            self.asr = asr
             state = .loading(fraction: 0.97, phase: "Downloading LS-EEND")
 
             // LS-EEND streaming diarizer. dihard3 variant is the general-
@@ -130,6 +127,8 @@ final class ModelHost {
             // embedding model. We only use the embedding side (LS-EEND handles
             // diarization itself), but DiarizerManager.extractSpeakerEmbedding
             // needs the segmentation model loaded to size its all-ones mask.
+            // (`AsrModels.defaultCacheDirectory` = path anchor only, see
+            // `modelsPresent`.)
             let diarizerCache = AsrModels.defaultCacheDirectory(for: .v2)
                 .deletingLastPathComponent()
                 .appending(path: "speaker-diarization", directoryHint: .isDirectory)
@@ -139,7 +138,7 @@ final class ModelHost {
             self.embeddingDiarizer = dm
 
             state = .ready
-            Self.log.info("Models ready (VAD + Parakeet v2 + LS-EEND dihard3 + WeSpeaker)")
+            Self.log.info("Models ready (VAD + Apple ASR + LS-EEND dihard3 + WeSpeaker)")
         } catch {
             Self.log.error("Model load failed: \(String(describing: error), privacy: .public)")
             state = .failed(String(describing: error))

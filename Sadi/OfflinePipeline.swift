@@ -87,7 +87,7 @@ enum OfflinePipeline {
     ) async throws -> Outcome {
         guard let embedder = modelHost.embeddingDiarizer,
               let vad = modelHost.vad,
-              let asrModels = modelHost.asrModels
+              let asr = modelHost.asr
         else { throw Failure.modelsNotLoaded }
 
         progress("Reading session…")
@@ -141,7 +141,7 @@ enum OfflinePipeline {
                         group.addTask {
                             try await transcribe(
                                 track: track, diar: diarSnapshot[track.source] ?? [],
-                                vad: vad, asrModels: asrModels, embedder: embedder)
+                                vad: vad, asr: asr, embedder: embedder)
                         }
                     }
                     var all: [Utterance] = []
@@ -401,12 +401,10 @@ enum OfflinePipeline {
 
     // MARK: - Rerun transcription
 
-    /// ASR worker tasks per track. Each worker owns its own `AsrManager`
-    /// against the shared `AsrModels` weights — the exact concurrency shape
-    /// the live pipeline already runs (one manager per stream). The ANE
-    /// serializes its own requests, but decoder/token CPU work between ANE
-    /// calls pipelines, so a few workers recover most of the idle time;
-    /// past ~4 the ANE is saturated and more just burn memory.
+    /// ASR worker tasks per track. Apple's speech service does its own
+    /// scheduling; each `AppleAsr.transcribe` call is an independent
+    /// analyzer session, so a few concurrent workers overlap the per-call
+    /// setup cost without contending on shared state.
     nonisolated private static let asrWorkersPerTrack = 4
 
     /// Full from-audio transcription of one track: whole-file VAD
@@ -420,7 +418,7 @@ enum OfflinePipeline {
         track: Track,
         diar: [DiarSegment],
         vad: VadManager,
-        asrModels: AsrModels,
+        asr: AppleAsr,
         embedder: DiarizerManager
     ) async throws -> [Utterance] {
         let rate = Resampler.targetRate  // 16_000
@@ -438,7 +436,6 @@ enum OfflinePipeline {
         ) { group in
             for w in 0..<workers {
                 group.addTask {
-                    let asr = AsrManager(config: .default, models: asrModels)
                     var results: [(Int, [Utterance])] = []
                     for i in stride(from: w, to: segments.count, by: workers) {
                         // Cancellation lands within one segment's latency
@@ -465,7 +462,7 @@ enum OfflinePipeline {
         _ seg: VadSegment,
         track: Track,
         diar: [DiarSegment],
-        asr: AsrManager,
+        asr: AppleAsr,
         embedder: DiarizerManager
     ) async throws -> [Utterance] {
         let rate = Resampler.targetRate
@@ -473,24 +470,23 @@ enum OfflinePipeline {
         let hi = min(track.samples.count, Int(seg.endTime * rate))
         let segmentSamples = Array(track.samples[lo..<hi])
 
-        var decoderState = try TdtDecoderState()
-        let result = try await asr.transcribe(segmentSamples, decoderState: &decoderState)
-        let fullText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = try await asr.transcribe(segmentSamples)
+        let fullText = result.text
         guard !fullText.isEmpty else { return [] }
 
-        guard let timings = result.tokenTimings, !timings.isEmpty else {
+        let words = result.words
+        guard !words.isEmpty else {
             let cluster = dominantCluster(startSec: seg.startTime, endSec: seg.endTime, in: diar)
             return [
                 makeUtterance(
                     track: track, text: fullText, words: nil,
                     runAudio: segmentSamples, fallbackAudio: segmentSamples,
                     startSec: seg.startTime, endSec: seg.endTime,
-                    cluster: cluster, confidence: result.confidence, embedder: embedder
+                    cluster: cluster, embedder: embedder
                 )
             ]
         }
 
-        let words = AsrWords.group(timings)
         let runs = SpeakerSegmenter.splitIntoRuns(
             tokens: words,
             speakerAt: { wordTimeRelative in
@@ -514,7 +510,7 @@ enum OfflinePipeline {
                     runAudio: runAudio, fallbackAudio: segmentSamples,
                     startSec: seg.startTime + run.startTime,
                     endSec: seg.startTime + run.endTime,
-                    cluster: run.speakerIndex, confidence: result.confidence,
+                    cluster: run.speakerIndex,
                     embedder: embedder
                 ))
         }
@@ -530,7 +526,6 @@ enum OfflinePipeline {
         startSec: Double,
         endSec: Double,
         cluster: Int?,
-        confidence: Float?,
         embedder: DiarizerManager
     ) -> Utterance {
         var sumSq: Float = 0
@@ -561,7 +556,6 @@ enum OfflinePipeline {
             startedAt: track.anchor.addingTimeInterval(startSec),
             endedAt: track.anchor.addingTimeInterval(endSec),
             embedding: embedding,
-            asrConfidence: confidence,
             rms: rms,
             diarCluster: cluster,
             wordTimings: timings,

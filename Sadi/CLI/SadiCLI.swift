@@ -99,7 +99,7 @@ enum SadiCLI {
         stderr("  dir: \(sessionDir.path(percentEncoded: false))")
 
         // 1. Models — fail fast if they aren't already downloaded.
-        guard ModelHost.modelsPresent() else {
+        guard await ModelHost.modelsPresent() else {
             throw CLIError(
                 "models not downloaded. Launch the Sadi app once to fetch them, then retry.",
                 code: 2
@@ -110,7 +110,7 @@ enum SadiCLI {
         await host.loadIfNeeded()
         guard host.state == .ready,
               let vad = host.vad,
-              let asrModels = host.asrModels,
+              let asr = host.asr,
               let diarizerModel = host.diarizerModel,
               let embeddingDiarizer = host.embeddingDiarizer
         else {
@@ -149,7 +149,7 @@ enum SadiCLI {
         try await FileReplayDriver.feed(
             tracks: tracks,
             vad: vad,
-            asrModels: asrModels,
+            asr: asr,
             diarizerModel: diarizerModel,
             embeddingDiarizer: embeddingDiarizer,
             store: store,
@@ -171,7 +171,7 @@ enum SadiCLI {
         stderr("Session: \(sessionDir.lastPathComponent)")
         stderr("  dir: \(sessionDir.path(percentEncoded: false))")
 
-        guard ModelHost.modelsPresent() else {
+        guard await ModelHost.modelsPresent() else {
             throw CLIError(
                 "models not downloaded. Launch the Sadi app once to fetch them, then retry.",
                 code: 2
@@ -303,9 +303,10 @@ enum SadiCLI {
 
     Replays a captured session through the exact StreamProcessor /
     TranscriptStore / ModelHost the GUI runs live — streaming VAD →
-    Parakeet ASR → LS-EEND diarization → WeSpeaker embedding → echo
-    filter → voiceprint resolution. Only the audio source differs: a
-    session's .mp4 tracks fed in chunks instead of live capture.
+    Apple SpeechTranscriber ASR → LS-EEND diarization → WeSpeaker
+    embedding → echo filter → voiceprint resolution. Only the audio
+    source differs: a session's .mp4 tracks fed in chunks instead of
+    live capture.
 
     Models, the voiceprint book, and recordings are read from the app's
     sandbox container, so a replay matches a live run.

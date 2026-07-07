@@ -32,7 +32,7 @@ This problem has been solved many times. Real-time VoIP comms use sophisticated 
 - No recovery of *quiet local speech that overlaps loud far-end speech* ("yeah/right" backchannels mid-far-end-turn). Explicitly acceptable to lose, per the primary use case.
 - No cloud ASR backends. Local-only.
 - No meeting platform integrations (Zoom SDK, Meet bot, Teams bot). Local capture only.
-- No multi-language UI in v1 (English ASR via Parakeet TDT v2).
+- No multi-language UI in v1 (system-locale ASR via Apple SpeechTranscriber, en-US fallback).
 
 ---
 
@@ -180,8 +180,8 @@ Backpressure: the ring is bounded. If `ring.push(...)` returns `false` (full) �
 
 ### 6.3 Per-Track ASR
 
-- **Model:** FluidAudio's **Parakeet TDT v2** (English). One `AsrManager` instance per track; both share the model weights but each has its own `TdtDecoderState`.
-- **Operation:** the ASR consumer pulls `SpeechSegment`s, allocates a fresh decoder state per segment (each segment is one independent utterance), runs `asr.transcribe(slice, decoderState: &state)`, and emits an `Utterance { source, startHostTime, endHostTime, text, embeddingHint?, confidence? }`.
+- **Model:** Apple **SpeechTranscriber** (macOS 26 `SpeechAnalyzer`), OS-shipped model, system locale with en-US fallback. One shared stateless `AppleAsr` wrapper; each call builds a fresh transcriber+analyzer session (each segment is one independent utterance). Replaced FluidAudio's Parakeet TDT v2 after a head-to-head showed raw accuracy is a wash and Sadi's value is in the surrounding pipeline (`scratch/speech-compare/ANALYSIS.md`).
+- **Operation:** the ASR consumer pulls `SpeechSegment`s, runs `asr.transcribe(slice)` (word-level `audioTimeRange` tokens ride along), and emits an `Utterance { source, startHostTime, endHostTime, text, embeddingHint? }`.
 - **Empty-text guard:** drop segments whose ASR text is empty after whitespace trim.
 - **Minimum-slice guard:** skip segments shorter than ~200 ms of audio. (Avoids the CoreML `E5RT: zero shape error` we saw on degenerate slices.)
 - **Output:** an `AsyncStream<Utterance>` per track.
@@ -429,7 +429,7 @@ Size envelope (per stream; double for a call with both mic + system):
 | **64 kbps (v1 default)** | ~0.5 MB | ~29 MB | ~145 MB |
 | 32 kbps (TODO: evaluate) | ~0.25 MB | ~14 MB | ~70 MB |
 
-**Open TODO:** Once we have a working pipeline, A/B-test 32 kbps against 64 kbps on real recordings — compare ASR transcripts (Parakeet output, ideally also a Whisper baseline) and listen-test the audio. AAC at 32 kbps mono is widely transparent for speech and is what podcast distribution often uses; if the WER delta on our recordings is in the noise, drop to 32 and halve storage. If it isn't, stay at 64.
+**Open TODO:** Once we have a working pipeline, A/B-test 32 kbps against 64 kbps on real recordings — compare ASR transcripts (SpeechTranscriber output, ideally also a Whisper baseline) and listen-test the audio. AAC at 32 kbps mono is widely transparent for speech and is what podcast distribution often uses; if the WER delta on our recordings is in the noise, drop to 32 and halve storage. If it isn't, stay at 64.
 
 Either way the archive is small enough that storage isn't a constraint — both rates are 1–2 orders of magnitude smaller than the Float32 CAF baseline we'd have shipped otherwise.
 
@@ -442,7 +442,7 @@ Minimal, focused; not a UI spec, but the contract the pipeline supports:
 - **Recordings list** — sidebar of past recordings, newest first. Click to view transcript.
 - **Live recording view** — shown while recording. Transcript appends in real time; each finalized `Utterance` slides in. A small "X" indicator on dropped (echo-filtered) utterances behind a debug toggle. Mode (call / mic-only) shown in the header.
 - **Transcript view** — past recording. Each utterance has its speaker label, time, and text. Click the label to rename / assign to a voiceprint.
-- **Settings** — ASR model selection (Parakeet v2 only in v1, but the surface is there), voiceprint book management.
+- **Settings** — ASR model selection (Apple SpeechTranscriber only in v1, but the surface is there), voiceprint book management.
 
 The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `TranscriptEvent` is `.appended(Utterance)`, `.updated(Utterance)`, `.dropped(Utterance, reason)`, `.speakerRelabeled(clusterID, Speaker)`.
 
@@ -451,7 +451,7 @@ The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `Transc
 ## 12. Dependencies & Entitlements
 
 ### Swift packages
-- **FluidAudio** (pinned to a known-good version; bump deliberately): provides Parakeet TDT v2 (ASR), LS-EEND (streaming diarizer), Silero VAD, and the embedding model used for voiceprints.
+- **FluidAudio** (pinned to a known-good version; bump deliberately): provides LS-EEND (streaming diarizer), Silero VAD, the offline diarizer, and the embedding model used for voiceprints. (ASR moved to Apple SpeechTranscriber; Parakeet is no longer downloaded.)
 - (Stretch) **Sparkle** for auto-update if/when shipped.
 
 No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAudio handles.
@@ -579,7 +579,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 
 4. **FluidAudio's embedding model dimension and stability.** Document the dimension (used in voiceprint storage); commit to a model version with bump procedure. If FluidAudio changes embedding spaces in a future version, existing voiceprints become unmatchable — need a migration path or model-version tag on each voiceprint.
 
-5. **ASR latency vs liveness.** Parakeet per-segment is fast (~100s of ms per a few-second segment on ANE), but two concurrent ASR streams + diarization is real load. Live transcript needs to keep up; if it doesn't, degrade to batching system-track ASR while keeping mic live (the user cares more about seeing their own thread of the conversation in real time — actually, no, they care more about the far-end; reverse this if needed).
+5. **ASR latency vs liveness.** SpeechTranscriber per-segment is fast (~70–270 ms per segment, measured), but two concurrent ASR streams + diarization is real load. Live transcript needs to keep up; if it doesn't, degrade to batching system-track ASR while keeping mic live (the user cares more about seeing their own thread of the conversation in real time — actually, no, they care more about the far-end; reverse this if needed).
 
 6. **CoreML `E5RT zero shape error`.** Saw this once on a degenerate slice during prepare(). Mitigation: enforce a minimum slice length in the ASR consumer (~200 ms). If it persists, file/investigate against FluidAudio.
 
@@ -595,7 +595,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 - Cloud anything.
 - Live captions overlay on top of the call app.
 - Meeting summarization, action items, knowledge-base integration (OpenOats does these; we don't, in v1).
-- Multi-language support (English Parakeet TDT only).
+- Multi-language support beyond the system locale (Apple SpeechTranscriber, en-US fallback).
 - iOS / iPad version.
 - Calendar integration / meeting auto-detect.
 - Automatic launching / always-on capture.
