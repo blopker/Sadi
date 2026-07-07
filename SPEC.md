@@ -28,11 +28,11 @@ This problem has been solved many times. Real-time VoIP comms use sophisticated 
 - **Robust to the common failure modes we know about** (multi-channel mics, sandbox quirks, sample-rate drift, bleed during far-end speech, similar-sounding local and far-end voices).
 
 ### Non-Goals
-- No real-time acoustic echo cancellation (FDAF / NLMS / WebRTC AEC). Validated against the in-category leader; not necessary at this scope.
+- No *custom* real-time acoustic echo cancellation (FDAF / NLMS / WebRTC AEC). The OS echo canceller (VoiceProcessingIO) runs in-line on the mic (§5.1); the text-level echo filter (§7) remains as backstop.
 - No recovery of *quiet local speech that overlaps loud far-end speech* ("yeah/right" backchannels mid-far-end-turn). Explicitly acceptable to lose, per the primary use case.
 - No cloud ASR backends. Local-only.
 - No meeting platform integrations (Zoom SDK, Meet bot, Teams bot). Local capture only.
-- No multi-language UI in v1 (English ASR via Parakeet TDT v2).
+- No multi-language UI in v1 (system-locale ASR via Apple SpeechTranscriber, en-US fallback).
 
 ---
 
@@ -126,11 +126,12 @@ Capacity per ring: sized for the maximum tolerated end-to-end consumer latency. 
 
 ### 5.1 Microphone Capture (`MicCapture`)
 
-- **Framework:** `AVAudioEngine` with an input-node tap on bus 0, buffer size 4096.
-- **No voice processing.** `setVoiceProcessingEnabled` is never called. The pipeline expects raw, unprocessed mic audio throughout. See §12 and Appendix A for the reasoning.
-- **Multi-channel handling:** Read the input node's current format. If `channelCount > 1`, take **channel 0 only** (per-buffer copy of `floatChannelData[0]`). MacBook built-in mics expose 3-channel arrays where channels 1+ are directional/cancellation beams; averaging them destroys the voice signal. The channel-0 extraction happens **inside the tap callback** (it's a pointer copy, allocation-free) before pushing to the ring.
-- **Sample rate:** Query the **hardware** nominal rate of the resolved input device (`AudioObjectGetPropertyData` with `kAudioDevicePropertyNominalSampleRate`) and prefer it over the `inputNode.outputFormat` rate when they disagree — this catches the post-device-switch lag where AVAudioEngine still reports the old rate for a beat. (Read once at session start; live changes mid-session are out of scope.)
-- **Tap callback work:** channel-0 extraction → `ring.push(data:)`. Nothing else. The first-buffer host time is recorded once via a separate atomic so the consumer can convert sample offsets to wall-clock dates.
+- **Framework:** a raw **VoiceProcessingIO** audio unit (`kAudioUnitSubType_VoiceProcessingIO`), input on element 1, output on element 0. Not `AVAudioEngine` (hidden aggregate devices, graph-rebuild storms on device changes — see Appendix A).
+- **OS echo cancellation in-line.** VPIO's AEC uses everything played to the bound output device — including other apps (Zoom/Meet) — as the echo reference, so far-end bleed is removed at capture. The whole pipeline (archive, ASR, voiceprints) sees echo-suppressed audio; §7's text-level filter is the backstop. The output element renders silence (it exists only as the reference tap). AGC is disabled; other-audio ducking is pinned to minimum (`kAUVoiceIOOtherAudioDuckingLevelMin`, advanced ducking off) so the user's call volume is not ducked. **Known cosmetic quirk:** at minimum ducking the steady-state attenuation of other audio measures 0 dB, but macOS still applies a *transient* duck (~-34 dB) when the voice session starts and when new audio streams begin, releasing over several seconds — an audible volume dip at recording start. This is coreaudiod's session ducking, not configurable below `.min` (the duck-off property is iOS-only and deprecated); its hysteresis is sloppy and the armed state can briefly outlive a session before clearing on its own or on the next session cycle. Measured via 440 Hz tone + raw AUHAL reference recorder (scratch/speech-compare/raw_rec.swift). Verified: `Sadi cli mic` with reference audio playing — the played speech transcribes to nothing while room audio survives (recipe probe: `scratch/speech-compare/vpio_probe.swift`).
+- **Multi-channel handling:** none needed — VPIO consumes the device's mic array itself and emits one processed voice channel (client format Float32 mono).
+- **Sample rate:** Query the **hardware** nominal rate of the resolved input device (`kAudioDevicePropertyNominalSampleRate`) once at init; VPIO's converters bridge device-rate changes across device switches to the fixed client rate.
+- **Device follow:** the unit follows the system default input (refusing Bluetooth mics — HFP conflicts with the system tap) *and* the system default output (the AEC reference must track wherever call audio plays; Bluetooth outputs are skipped in favor of a non-BT device since headphones have no speaker→mic bleed to cancel).
+- **Input callback work:** render processed mono → host-time gap fill → `ring.push(data:)`. Nothing else. The first-buffer host time is recorded once via a separate atomic so the consumer can convert sample offsets to wall-clock dates.
 - **No file write here.** The consumer thread pulls samples and writes the archive file (§6.1).
 
 ### 5.2 System Audio Capture (`SystemAudioCapture`)
@@ -180,8 +181,8 @@ Backpressure: the ring is bounded. If `ring.push(...)` returns `false` (full) �
 
 ### 6.3 Per-Track ASR
 
-- **Model:** FluidAudio's **Parakeet TDT v2** (English). One `AsrManager` instance per track; both share the model weights but each has its own `TdtDecoderState`.
-- **Operation:** the ASR consumer pulls `SpeechSegment`s, allocates a fresh decoder state per segment (each segment is one independent utterance), runs `asr.transcribe(slice, decoderState: &state)`, and emits an `Utterance { source, startHostTime, endHostTime, text, embeddingHint?, confidence? }`.
+- **Model:** Apple **SpeechTranscriber** (macOS 26 `SpeechAnalyzer`), OS-shipped model, system locale with en-US fallback. One shared stateless `AppleAsr` wrapper; each call builds a fresh transcriber+analyzer session (each segment is one independent utterance). Replaced FluidAudio's Parakeet TDT v2 after a head-to-head showed raw accuracy is a wash and Sadi's value is in the surrounding pipeline (`scratch/speech-compare/ANALYSIS.md`).
+- **Operation:** the ASR consumer pulls `SpeechSegment`s, runs `asr.transcribe(slice)` (word-level `audioTimeRange` tokens ride along), and emits an `Utterance { source, startHostTime, endHostTime, text, embeddingHint? }`.
 - **Empty-text guard:** drop segments whose ASR text is empty after whitespace trim.
 - **Minimum-slice guard:** skip segments shorter than ~200 ms of audio. (Avoids the CoreML `E5RT: zero shape error` we saw on degenerate slices.)
 - **Output:** an `AsyncStream<Utterance>` per track.
@@ -429,7 +430,7 @@ Size envelope (per stream; double for a call with both mic + system):
 | **64 kbps (v1 default)** | ~0.5 MB | ~29 MB | ~145 MB |
 | 32 kbps (TODO: evaluate) | ~0.25 MB | ~14 MB | ~70 MB |
 
-**Open TODO:** Once we have a working pipeline, A/B-test 32 kbps against 64 kbps on real recordings — compare ASR transcripts (Parakeet output, ideally also a Whisper baseline) and listen-test the audio. AAC at 32 kbps mono is widely transparent for speech and is what podcast distribution often uses; if the WER delta on our recordings is in the noise, drop to 32 and halve storage. If it isn't, stay at 64.
+**Open TODO:** Once we have a working pipeline, A/B-test 32 kbps against 64 kbps on real recordings — compare ASR transcripts (SpeechTranscriber output, ideally also a Whisper baseline) and listen-test the audio. AAC at 32 kbps mono is widely transparent for speech and is what podcast distribution often uses; if the WER delta on our recordings is in the noise, drop to 32 and halve storage. If it isn't, stay at 64.
 
 Either way the archive is small enough that storage isn't a constraint — both rates are 1–2 orders of magnitude smaller than the Float32 CAF baseline we'd have shipped otherwise.
 
@@ -442,7 +443,7 @@ Minimal, focused; not a UI spec, but the contract the pipeline supports:
 - **Recordings list** — sidebar of past recordings, newest first. Click to view transcript.
 - **Live recording view** — shown while recording. Transcript appends in real time; each finalized `Utterance` slides in. A small "X" indicator on dropped (echo-filtered) utterances behind a debug toggle. Mode (call / mic-only) shown in the header.
 - **Transcript view** — past recording. Each utterance has its speaker label, time, and text. Click the label to rename / assign to a voiceprint.
-- **Settings** — ASR model selection (Parakeet v2 only in v1, but the surface is there), voiceprint book management.
+- **Settings** — ASR model selection (Apple SpeechTranscriber only in v1, but the surface is there), voiceprint book management.
 
 The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `TranscriptEvent` is `.appended(Utterance)`, `.updated(Utterance)`, `.dropped(Utterance, reason)`, `.speakerRelabeled(clusterID, Speaker)`.
 
@@ -451,7 +452,7 @@ The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `Transc
 ## 12. Dependencies & Entitlements
 
 ### Swift packages
-- **FluidAudio** (pinned to a known-good version; bump deliberately): provides Parakeet TDT v2 (ASR), LS-EEND (streaming diarizer), Silero VAD, and the embedding model used for voiceprints.
+- **FluidAudio** (pinned to a known-good version; bump deliberately): provides LS-EEND (streaming diarizer), Silero VAD, the offline diarizer, and the embedding model used for voiceprints. (ASR moved to Apple SpeechTranscriber; Parakeet is no longer downloaded.)
 - (Stretch) **Sparkle** for auto-update if/when shipped.
 
 No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAudio handles.
@@ -579,7 +580,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 
 4. **FluidAudio's embedding model dimension and stability.** Document the dimension (used in voiceprint storage); commit to a model version with bump procedure. If FluidAudio changes embedding spaces in a future version, existing voiceprints become unmatchable — need a migration path or model-version tag on each voiceprint.
 
-5. **ASR latency vs liveness.** Parakeet per-segment is fast (~100s of ms per a few-second segment on ANE), but two concurrent ASR streams + diarization is real load. Live transcript needs to keep up; if it doesn't, degrade to batching system-track ASR while keeping mic live (the user cares more about seeing their own thread of the conversation in real time — actually, no, they care more about the far-end; reverse this if needed).
+5. **ASR latency vs liveness.** SpeechTranscriber per-segment is fast (~70–270 ms per segment, measured), but two concurrent ASR streams + diarization is real load. Live transcript needs to keep up; if it doesn't, degrade to batching system-track ASR while keeping mic live (the user cares more about seeing their own thread of the conversation in real time — actually, no, they care more about the far-end; reverse this if needed).
 
 6. **CoreML `E5RT zero shape error`.** Saw this once on a degenerate slice during prepare(). Mitigation: enforce a minimum slice length in the ASR consumer (~200 ms). If it persists, file/investigate against FluidAudio.
 
@@ -591,11 +592,11 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 
 ## 15. Out of Scope
 
-- Real-time AEC (FDAF, NLMS, WebRTC). Not used by in-category leaders; doesn't fit our priorities.
+- Custom real-time AEC (FDAF, NLMS, WebRTC). The OS canceller (§5.1) covers speaker bleed; building our own doesn't fit our priorities.
 - Cloud anything.
 - Live captions overlay on top of the call app.
 - Meeting summarization, action items, knowledge-base integration (OpenOats does these; we don't, in v1).
-- Multi-language support (English Parakeet TDT only).
+- Multi-language support beyond the system locale (Apple SpeechTranscriber, en-US fallback).
 - iOS / iPad version.
 - Calendar integration / meeting auto-detect.
 - Automatic launching / always-on capture.
@@ -606,7 +607,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 
 This spec encodes specific failures from the previous iteration:
 
-- **VPIO is not used at all.** Under the App Sandbox it requires a `com.apple.security.temporary-exception.mach-lookup.global-name` entitlement for `com.apple.audioanalyticsd` and produces continuous downlink-DSP faults if its render side isn't driven. Attempting to drive it (silent source on the output) created I/O overload that degraded mic capture. And its acoustic echo cancellation can only cancel audio our own engine renders — never another app's playback — so it cannot solve the bleed problem regardless. Also: on some hardware it exposes the mic as a multi-channel "discrete" format that silently downmixes to zero. The mono channel-0 capture below is the defensive choice independent of voice processing.
+- **VPIO is not used at all.** *(Revisited and reversed on macOS 26 — see §5.1.)* The v0 failures no longer reproduce: a sandboxed VPIO unit starts cleanly with no mach-lookup exception entitlement, no downlink-DSP faults, and no I/O overload (silence render callback on the output element, `kAudioUnitProperty_SetRenderCallback`). The claim that VPIO only cancels our own engine's playback was empirically wrong on macOS 26: a separate process's speaker playback is fully cancelled (`Sadi cli mic` while a second process plays reference audio → empty transcript). Historical v0 record kept for context: sandbox required `com.apple.security.temporary-exception.mach-lookup.global-name` for `com.apple.audioanalyticsd`; undriven render side produced continuous downlink-DSP faults; driving it created I/O overload; some hardware exposed a multi-channel "discrete" format that silently downmixed to zero.
 - **Mono channel-0 capture, not averaging.** MacBook built-in mic arrays expose multi-channel formats (front beam + directional / cancellation beams); averaging across channels causes destructive interference and effectively silences the voice. Always take channel 0.
 - **Diarizing a *mix* of mic + system collapses both speakers into one cluster** when one is much louder. Per-track ASR is not negotiable.
 - **Per-track normalization + raw energy comparison for bleed gating** is necessary (normalization is needed so ASR sees the quiet mic; raw comparison is needed so the energy gate isn't fooled by the boost).

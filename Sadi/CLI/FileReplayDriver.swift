@@ -59,7 +59,7 @@ enum FileReplayDriver {
     static func feed(
         tracks: [Track],
         vad: VadManager,
-        asrModels: AsrModels,
+        asr: AppleAsr,
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
@@ -72,7 +72,7 @@ enum FileReplayDriver {
                 source: track.source,
                 sourceRate: track.sampleRate,
                 vad: vad,
-                asrModels: asrModels,
+                asr: asr,
                 diarizerModel: diarizerModel,
                 embeddingDiarizer: embeddingDiarizer,
                 store: store,

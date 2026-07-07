@@ -4,20 +4,19 @@ import OSLog
 import SadiKit
 
 /// Per-stream (mic or system) transcription pipeline:
-/// source-rate samples → 16 kHz resample → Silero streaming VAD → Parakeet
-/// ASR → Utterance published to the TranscriptStore.
+/// source-rate samples → 16 kHz resample → Silero streaming VAD → Apple
+/// SpeechTranscriber ASR → Utterance published to the TranscriptStore.
 ///
-/// One instance per stream. Owns its own resampler and `AsrManager` (sharing
-/// model weights from `ModelHost`; decoder state is fresh per segment, per
-/// SPEC §6.3). VAD segmentation uses FluidAudio's `processStreamingChunk`,
-/// which runs the Silero hysteresis state machine for us and emits
-/// `.speechStart` / `.speechEnd` events.
+/// One instance per stream. Owns its own resampler; the (stateless) Apple
+/// ASR engine is shared via `ModelHost`. VAD segmentation uses FluidAudio's
+/// `processStreamingChunk`, which runs the Silero hysteresis state machine
+/// for us and emits `.speechStart` / `.speechEnd` events.
 actor StreamProcessor {
     private let source: Source
     private var resampler: Resampler
     private var resamplerSourceRate: Double
     private let vad: VadManager
-    private let asr: AsrManager
+    private let asr: AppleAsr
     private let diarizer: LSEENDDiarizer
     private let embeddingDiarizer: DiarizerManager
     private let store: TranscriptStore
@@ -40,12 +39,10 @@ actor StreamProcessor {
     private var windowCapSamples: Int { windowCapSeconds * Int(Resampler.targetRate) }
 
     private let minSpeechSamples = Int(Resampler.targetRate * 0.3)  // 300 ms
-    // Backstop force-split for speech that never hits a VAD pause. 60 s rather
-    // than the old 14 s: AsrManager.transcribe internally chunks audio > ~15 s
-    // via ChunkProcessor (overlapping windows + token dedup), so long segments
-    // transcribe fine — and more cleanly than several cold 14 s force-splits,
-    // which each restart the decoder with no overlap. Trades worst-case latency
-    // on a 60 s-unbroken monologue for far fewer mid-word seams.
+    // Backstop force-split for speech that never hits a VAD pause. Apple's
+    // SpeechAnalyzer handles arbitrarily long input (it's a whole-file API),
+    // so 60 s is purely a latency bound: the worst-case wait before a
+    // pause-free monologue shows up in the transcript.
     private let maxSpeechSamples = Int(Resampler.targetRate * 60)
 
     private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "stream")
@@ -54,7 +51,7 @@ actor StreamProcessor {
         source: Source,
         sourceRate: Double,
         vad: VadManager,
-        asrModels: AsrModels,
+        asr: AppleAsr,
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
@@ -64,7 +61,7 @@ actor StreamProcessor {
         self.resampler = try Resampler(sourceRate: sourceRate, maxInputFrames: 2048)
         self.resamplerSourceRate = sourceRate
         self.vad = vad
-        self.asr = AsrManager(config: .default, models: asrModels)
+        self.asr = asr
         self.diarizer = try LSEENDDiarizer(model: diarizerModel)
         self.embeddingDiarizer = embeddingDiarizer
         self.store = store
@@ -197,15 +194,15 @@ actor StreamProcessor {
         let segmentSamples = Array(window[startInWindow..<endInWindow])
 
         do {
-            var decoderState = try TdtDecoderState()
-            let result = try await asr.transcribe(segmentSamples, decoderState: &decoderState)
-            let fullText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let result = try await asr.transcribe(segmentSamples)
+            let fullText = result.text
             guard !fullText.isEmpty else { return }
 
             let segmentStartSec = Double(absoluteStart) / Resampler.targetRate
 
-            // No per-token timing → single Utterance with dominant speaker.
-            guard let timings = result.tokenTimings, !timings.isEmpty else {
+            // No per-word timing → single Utterance with dominant speaker.
+            let words = result.words
+            guard !words.isEmpty else {
                 let cluster = dominantCluster(
                     startSec: segmentStartSec, endSec: Double(absoluteEnd) / Resampler.targetRate)
                 let speaker = label(source: source, cluster: cluster)
@@ -217,16 +214,14 @@ actor StreamProcessor {
                     runStartSample: absoluteStart,
                     runEndSample: absoluteEnd,
                     speaker: speaker,
-                    cluster: cluster,
-                    confidence: result.confidence
+                    cluster: cluster
                 )
                 return
             }
 
-            // Per-token timing → split this VAD segment into one Utterance per
+            // Per-word timing → split this VAD segment into one Utterance per
             // speaker-coherent word run. `Sadi cli replay` drives this exact
             // path from recorded files (see Sadi/CLI/FileReplayDriver.swift).
-            let words = AsrWords.group(timings)
             let runs = SpeakerSegmenter.splitIntoRuns(
                 tokens: words,
                 speakerAt: { [self] wordTimeRelative in
@@ -257,8 +252,7 @@ actor StreamProcessor {
                     runStartSample: runStartSample,
                     runEndSample: runEndSample,
                     speaker: speaker,
-                    cluster: run.speakerIndex,
-                    confidence: result.confidence
+                    cluster: run.speakerIndex
                 )
             }
         } catch {
@@ -274,8 +268,7 @@ actor StreamProcessor {
         runStartSample: Int64,
         runEndSample: Int64,
         speaker: SadiKit.Speaker,
-        cluster: Int?,
-        confidence: Float?
+        cluster: Int?
     ) async {
         var sumSq: Float = 0
         for v in runAudio { sumSq += v * v }
@@ -310,7 +303,6 @@ actor StreamProcessor {
             startedAt: wallClock(forSample: runStartSample),
             endedAt: wallClock(forSample: runEndSample),
             embedding: embedding,
-            asrConfidence: confidence,
             rms: rms,
             diarCluster: cluster,
             wordTimings: timings,

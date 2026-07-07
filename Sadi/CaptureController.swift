@@ -66,7 +66,7 @@ final class CaptureController {
     func start() {
         guard phase == .idle else { return }
         guard modelHost.vad != nil,
-              modelHost.asrModels != nil,
+              modelHost.asr != nil,
               modelHost.diarizerModel != nil,
               modelHost.embeddingDiarizer != nil
         else {
@@ -82,7 +82,7 @@ final class CaptureController {
 
     private func performStart() async {
         guard let vad = modelHost.vad,
-              let asrModels = modelHost.asrModels,
+              let asr = modelHost.asr,
               let diarizerModel = modelHost.diarizerModel,
               let embeddingDiarizer = modelHost.embeddingDiarizer
         else {
@@ -135,7 +135,7 @@ final class CaptureController {
                     source: .mic,
                     sourceRate: mic.sampleRate,
                     vad: vad,
-                    asrModels: asrModels,
+                    asr: asr,
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
@@ -201,7 +201,7 @@ final class CaptureController {
     /// `AudioDeviceStart` can block on the TCC permission prompt.
     private func startSystemPipeline(in session: ActiveSession) async {
         guard let vad = modelHost.vad,
-              let asrModels = modelHost.asrModels,
+              let asr = modelHost.asr,
               let diarizerModel = modelHost.diarizerModel,
               let embeddingDiarizer = modelHost.embeddingDiarizer
         else { return }
@@ -225,7 +225,7 @@ final class CaptureController {
                     source: .system,
                     sourceRate: system.sampleRate,
                     vad: vad,
-                    asrModels: asrModels,
+                    asr: asr,
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
