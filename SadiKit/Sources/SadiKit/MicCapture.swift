@@ -78,8 +78,13 @@ public final class MicCapture: @unchecked Sendable {
     private let isRunningAtomic = Atomic<Bool>(false)
 
     /// Serializes device-follow against itself; also the queue the CoreAudio
-    /// default-device listeners fire on.
-    private let reconfigQueue = DispatchQueue(label: "io.kbl.sadi.miccapture.reconfig")
+    /// default-device listeners fire on. Explicit `.userInitiated` QoS:
+    /// `stop()` is called from user-initiated tasks and does a `sync` wait on
+    /// this queue for the (blocking) VPIO teardown — an unspecified-QoS queue
+    /// there trips the Thread Performance Checker's priority-inversion
+    /// diagnostic.
+    private let reconfigQueue = DispatchQueue(
+        label: "io.kbl.sadi.miccapture.reconfig", qos: .userInitiated)
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     /// Input device the unit is currently bound to (element 1).
