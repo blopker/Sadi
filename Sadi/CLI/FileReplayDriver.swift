@@ -63,8 +63,15 @@ enum FileReplayDriver {
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
-        startWallClock: Date
+        startWallClock: Date,
+        aec: LocalVQE? = nil
     ) async throws {
+        // Same AEC wiring as the live CaptureController: one canceller per
+        // replay, mic cleaned against the system track. Both replay streams
+        // share `startWallClock` as their anchor, so alignment is exact.
+        let canceller: EchoCanceller? =
+            tracks.contains { $0.source == .system } ? aec.map { EchoCanceller(engine: $0) } : nil
+
         // Build one StreamProcessor per track — same construction the live
         // CaptureController uses, minus the capture source and archive writer.
         let processors = try tracks.map { track -> (proc: StreamProcessor, track: Track) in
@@ -76,7 +83,8 @@ enum FileReplayDriver {
                 diarizerModel: diarizerModel,
                 embeddingDiarizer: embeddingDiarizer,
                 store: store,
-                startWallClock: startWallClock
+                startWallClock: startWallClock,
+                echoCanceller: canceller
             )
             return (proc, track)
         }

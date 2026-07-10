@@ -4,19 +4,27 @@ import OSLog
 import SadiKit
 
 /// Per-stream (mic or system) transcription pipeline:
-/// source-rate samples → 16 kHz resample → Silero streaming VAD → Apple
-/// SpeechTranscriber ASR → Utterance published to the TranscriptStore.
+/// source-rate samples → 16 kHz resample → [mic: LocalVQE echo cancellation]
+/// → Silero streaming VAD → Apple SpeechTranscriber ASR → Utterance
+/// published to the TranscriptStore.
 ///
 /// One instance per stream. Owns its own resampler; the (stateless) Apple
-/// ASR engine is shared via `ModelHost`. VAD segmentation uses FluidAudio's
-/// `processStreamingChunk`, which runs the Silero hysteresis state machine
-/// for us and emits `.speechStart` / `.speechEnd` events.
+/// ASR engine is shared via `ModelHost`. When an `EchoCanceller` is wired
+/// (call mode), the mic instance consumes *cleaned* 16 kHz audio for
+/// everything downstream — VAD, diarizer, ASR, embeddings — while the
+/// system instance feeds the same canceller as the far-end reference. The
+/// canceller preserves sample count/order, so the cleaned stream's indices
+/// (and therefore all wall-clock math) are identical to the raw stream's.
+/// VAD segmentation uses FluidAudio's `processStreamingChunk`, which runs
+/// the Silero hysteresis state machine for us and emits `.speechStart` /
+/// `.speechEnd` events.
 actor StreamProcessor {
     private let source: Source
     private var resampler: Resampler
     private var resamplerSourceRate: Double
     private let vad: VadManager
     private let asr: AppleAsr
+    private let echoCanceller: EchoCanceller?
     private let diarizer: LSEENDDiarizer
     private let embeddingDiarizer: DiarizerManager
     private let store: TranscriptStore
@@ -55,13 +63,15 @@ actor StreamProcessor {
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
-        startWallClock: Date
+        startWallClock: Date,
+        echoCanceller: EchoCanceller? = nil
     ) throws {
         self.source = source
         self.resampler = try Resampler(sourceRate: sourceRate, maxInputFrames: 2048)
         self.resamplerSourceRate = sourceRate
         self.vad = vad
         self.asr = asr
+        self.echoCanceller = echoCanceller
         self.diarizer = try LSEENDDiarizer(model: diarizerModel)
         self.embeddingDiarizer = embeddingDiarizer
         self.store = store
@@ -92,8 +102,12 @@ actor StreamProcessor {
     }
 
     /// Feed a chunk of source-rate Float32 mono samples (the same chunk the
-    /// archive writer just consumed). Resamples → VAD → on speech-end, slices
-    /// the window and transcribes.
+    /// archive writer just consumed). Resamples → AEC (mic, call mode) →
+    /// VAD → on speech-end, slices the window and transcribes.
+    ///
+    /// The archive writer upstream always receives the RAW stream: archives
+    /// stay pristine so an offline rerun can always regenerate (with this or
+    /// any future echo canceller).
     func feed(_ samples: [Float]) async {
         let resampled: [Float]
         do {
@@ -104,13 +118,33 @@ actor StreamProcessor {
         }
         guard !resampled.isEmpty else { return }
 
-        pending16k.append(contentsOf: resampled)
+        let samples16k: [Float]
+        if let echoCanceller {
+            switch source {
+            case .mic:
+                // Cleaned audio may lag the input (bounded) while the
+                // canceller waits for its reference; count/order are
+                // preserved across the stream.
+                samples16k = await echoCanceller.processMic(resampled, anchor: startWallClock)
+            case .system:
+                await echoCanceller.feedReference(resampled, anchor: startWallClock)
+                samples16k = resampled
+            }
+        } else {
+            samples16k = resampled
+        }
+        guard !samples16k.isEmpty else { return }
+        await advance16k(samples16k)
+    }
+
+    private func advance16k(_ samples16k: [Float]) async {
+        pending16k.append(contentsOf: samples16k)
         let chunkSize = VadManager.chunkSize
 
-        // Feed the diarizer once per resample call — it accepts any chunk
-        // size, so we don't need the same 4096-step buffering as Silero VAD.
+        // Feed the diarizer once per call — it accepts any chunk size, so we
+        // don't need the same 4096-step buffering as Silero VAD.
         do {
-            _ = try diarizer.process(samples: resampled, sourceSampleRate: 16_000.0)
+            _ = try diarizer.process(samples: samples16k, sourceSampleRate: 16_000.0)
         } catch {
             Self.log.error("Diarize step failed: \(String(describing: error), privacy: .public)")
         }
@@ -134,6 +168,13 @@ actor StreamProcessor {
     /// remainder still sitting in `pending16k` (< ~256 ms) is below the
     /// 300 ms minimum segment length and is dropped with the stream.
     func flush() async {
+        // Drain audio still buffered in the echo canceller (mic frames that
+        // were waiting on the reference stream) so end-of-recording speech
+        // isn't truncated.
+        if let echoCanceller, source == .mic {
+            let tail = await echoCanceller.flushMic()
+            if !tail.isEmpty { await advance16k(tail) }
+        }
         guard let start = pendingSpeechStart else { return }
         pendingSpeechStart = nil
         await emit(absoluteStart: start, absoluteEnd: Int64(streamState.processedSamples))

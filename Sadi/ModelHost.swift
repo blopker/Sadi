@@ -2,6 +2,7 @@ import FluidAudio
 import Foundation
 import Observation
 import OSLog
+import SadiKit
 
 // FluidAudio's LSEENDModel uses an internal NSLock to serialize predict calls
 // (see Sources/FluidAudio/Diarizer/LS-EEND/LSEENDInference.swift). It does not
@@ -31,6 +32,10 @@ final class ModelHost {
     private(set) var state: LoadState = .idle
     private(set) var vad: VadManager?
     private(set) var asr: AppleAsr?
+    /// LocalVQE echo-cancellation engine (v1.4-AEC). Optional: when the
+    /// dylib/model can't be loaded the pipeline runs without acoustic AEC
+    /// (the text-level EchoFilter remains), so load failure is non-fatal.
+    private(set) var aec: LocalVQE?
     private(set) var diarizerModel: LSEENDModel?
     private(set) var embeddingDiarizer: DiarizerManager?
     /// Offline (batch) diarization model set — loaded lazily on the first
@@ -65,6 +70,29 @@ final class ModelHost {
         }
         guard fluidPresent else { return false }
         return await AppleAsr.assetsInstalled()
+    }
+
+    /// Locate the LocalVQE dylib + model. In the app bundle: dylib embedded
+    /// in Frameworks (code-signed on copy), model in Resources. The env var
+    /// override serves headless/dev runs outside a full bundle.
+    nonisolated static func localVQELocations() -> (library: URL, model: URL)? {
+        let modelName = "localvqe-v1.4-aec-200K-f32.gguf"
+        let fm = FileManager.default
+        var candidates: [(URL, URL)] = []
+        if let dir = ProcessInfo.processInfo.environment["SADI_LOCALVQE_DIR"] {
+            let d = URL(fileURLWithPath: dir, isDirectory: true)
+            candidates.append((d.appending(path: "liblocalvqe.dylib"), d.appending(path: modelName)))
+        }
+        if let fw = Bundle.main.privateFrameworksURL, let res = Bundle.main.resourceURL {
+            candidates.append((
+                fw.appending(path: "liblocalvqe.dylib"),
+                res.appending(path: modelName)
+            ))
+        }
+        return candidates.first { lib, model in
+            fm.fileExists(atPath: lib.path(percentEncoded: false))
+                && fm.fileExists(atPath: model.path(percentEncoded: false))
+        }
     }
 
     /// Load (downloading on first use) the offline diarizer models. Memoized;
@@ -110,6 +138,20 @@ final class ModelHost {
                 }
             }
             self.asr = asr
+            state = .loading(fraction: 0.96, phase: "Loading echo canceller")
+
+            // LocalVQE AEC — bundled, loads in tens of ms. Non-fatal: without
+            // it the mic path runs raw and the text-level echo filter carries
+            // the load alone.
+            if let (lib, model) = Self.localVQELocations() {
+                do {
+                    self.aec = try LocalVQE(libraryURL: lib, modelURL: model)
+                } catch {
+                    Self.log.error("LocalVQE load failed (continuing without AEC): \(String(describing: error), privacy: .public)")
+                }
+            } else {
+                Self.log.error("LocalVQE dylib/model not found (continuing without AEC)")
+            }
             state = .loading(fraction: 0.97, phase: "Downloading LS-EEND")
 
             // LS-EEND streaming diarizer. dihard3 variant is the general-

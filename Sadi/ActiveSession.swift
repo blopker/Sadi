@@ -365,6 +365,12 @@ final class ActiveSession {
     let startedAt: Date
 
     private(set) var pipelines: [StreamPipeline] = []
+    /// Session-scoped acoustic echo canceller. Created at mic bring-up (when
+    /// the AEC engine is loaded); the mic StreamProcessor consumes cleaned
+    /// audio through it and the system StreamProcessor feeds it the far-end
+    /// reference. One per session — its streaming state and stream anchors
+    /// are recording-specific.
+    var echoCanceller: EchoCanceller?
     /// Watches transcript activity and auto-stops after the configured idle
     /// window. Cancel-only on stop (no await) — when auto-stop fires, this
     /// task *is* the stop caller, so awaiting it would deadlock.

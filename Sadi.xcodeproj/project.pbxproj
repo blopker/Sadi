@@ -9,11 +9,29 @@
 /* Begin PBXBuildFile section */
 		33E50BAA2FC6C68500736FD9 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 33E50BA92FC6C68500736FD9 /* FluidAudio */; };
 		A0001001000000000000A003 /* SadiKit in Frameworks */ = {isa = PBXBuildFile; productRef = A0001001000000000000A002 /* SadiKit */; };
+		A0002001000000000000B003 /* liblocalvqe.dylib in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = A0002001000000000000B001 /* liblocalvqe.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		A0002001000000000000B004 /* localvqe-v1.4-aec-200K-f32.gguf in Resources */ = {isa = PBXBuildFile; fileRef = A0002001000000000000B002 /* localvqe-v1.4-aec-200K-f32.gguf */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		33E50B832FC6C50400736FD9 /* Sadi.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Sadi.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A0002001000000000000B001 /* liblocalvqe.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; path = Vendor/localvqe/liblocalvqe.dylib; sourceTree = "<group>"; };
+		A0002001000000000000B002 /* localvqe-v1.4-aec-200K-f32.gguf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Vendor/localvqe/localvqe-v1.4-aec-200K-f32.gguf"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A0002001000000000000B005 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				A0002001000000000000B003 /* liblocalvqe.dylib in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		33E50B852FC6C50400736FD9 /* Sadi */ = {
@@ -40,6 +58,8 @@
 			isa = PBXGroup;
 			children = (
 				33E50B852FC6C50400736FD9 /* Sadi */,
+				A0002001000000000000B001 /* liblocalvqe.dylib */,
+				A0002001000000000000B002 /* localvqe-v1.4-aec-200K-f32.gguf */,
 				33E50B842FC6C50400736FD9 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -62,6 +82,7 @@
 				33E50B7F2FC6C50400736FD9 /* Sources */,
 				33E50B802FC6C50400736FD9 /* Frameworks */,
 				33E50B812FC6C50400736FD9 /* Resources */,
+				A0002001000000000000B005 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -123,6 +144,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A0002001000000000000B004 /* localvqe-v1.4-aec-200K-f32.gguf in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

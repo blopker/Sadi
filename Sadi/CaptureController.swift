@@ -131,6 +131,9 @@ final class CaptureController {
                 return (m, w, Date())
             }.value
             do {
+                // One canceller per session; nil when the engine didn't load
+                // (mic then runs raw and the text-level echo filter carries).
+                session.echoCanceller = modelHost.aec.map { EchoCanceller(engine: $0) }
                 let processor = try StreamProcessor(
                     source: .mic,
                     sourceRate: mic.sampleRate,
@@ -139,7 +142,8 @@ final class CaptureController {
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
-                    startWallClock: anchor
+                    startWallClock: anchor,
+                    echoCanceller: session.echoCanceller
                 )
                 session.add(StreamPipeline(
                     source: .mic,
@@ -229,7 +233,8 @@ final class CaptureController {
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
-                    startWallClock: anchor
+                    startWallClock: anchor,
+                    echoCanceller: session.echoCanceller
                 )
                 session.add(StreamPipeline(
                     source: .system,

@@ -105,14 +105,40 @@ enum OfflinePipeline {
 
         progress("Decoding audio…")
         let sessionStart = session.startedAt
-        let tracks = try await hop {
+        var tracks = try await hop {
             try await decodeTracks(segment: segment, sessionStart: sessionStart, directory: sessionDirectory)
         }
         guard !tracks.isEmpty else { throw Failure.noAudio }
 
+        // Acoustic echo cancellation over the decoded mic track, system track
+        // as the far-end reference — the same LocalVQE stage the live pipeline
+        // runs, applied batch and BEFORE diarization so echo can't seed
+        // phantom mic clusters or pollute embeddings. Archives are raw, so
+        // every pass re-derives the cleaned mic from scratch (benefiting from
+        // whatever model ships at that time). Best-effort: without the engine
+        // the pass proceeds on raw mic + the text-level echo filter.
+        if let aec = modelHost.aec,
+           let micIdx = tracks.firstIndex(where: { $0.source == .mic }),
+           let sys = tracks.first(where: { $0.source == .system }) {
+            progress("Cancelling echo…")
+            let micTrack = tracks[micIdx]
+            let cleaned = try await hop {
+                let canceller = EchoCanceller(engine: aec)
+                await canceller.feedReference(sys.samples, anchor: sys.anchor)
+                var out = await canceller.processMic(micTrack.samples, anchor: micTrack.anchor)
+                out += await canceller.flushMic()
+                return out
+            }
+            tracks[micIdx] = Track(source: .mic, anchor: micTrack.anchor, samples: cleaned)
+        }
+
+        // Post-AEC track set is immutable from here; snapshot for the
+        // Sendable hop closures.
+        let finalTracks = tracks
+
         progress("Diarizing…")
         let diar = try await hop {
-            try await diarize(tracks: tracks, models: offlineModels)
+            try await diarize(tracks: finalTracks, models: offlineModels)
         }
 
         // The utterance set: draft from disk (finalize) or from audio (rerun).
@@ -130,11 +156,12 @@ enum OfflinePipeline {
                 RecordingsStore.loadTranscript(from: sessionDirectory)
                     .filter { $0.assignmentKind == .manual }
             }
+
             progress("Transcribing…")
             // Both tracks at once; each track internally fans its segments
             // out over an ASR worker pool (see `transcribe`).
             let diarSnapshot = diar
-            let trackSnapshot = tracks
+            let trackSnapshot = finalTracks
             let fresh = try await hop {
                 try await withThrowingTaskGroup(of: [Utterance].self) { group in
                     for track in trackSnapshot {
@@ -161,12 +188,12 @@ enum OfflinePipeline {
         try Task.checkCancellation()
 
         // Tail: clusters → labels → voiceprints → echo. Pure value passes.
-        utterances = reassignClusters(utterances, diar: diar, tracks: tracks)
+        utterances = reassignClusters(utterances, diar: diar, tracks: finalTracks)
         utterances = relabel(utterances)
 
         progress("Matching voiceprints…")
         let centroids = try await hop {
-            clusterCentroids(tracks: tracks, diar: diar, embedder: embedder)
+            clusterCentroids(tracks: finalTracks, diar: diar, embedder: embedder)
         }
         // Apply matches system-first so the mic pass can ask "is this
         // identity a far-end speaker?" against final system labels. A mic

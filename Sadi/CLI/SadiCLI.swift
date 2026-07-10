@@ -165,7 +165,8 @@ enum SadiCLI {
             diarizerModel: diarizerModel,
             embeddingDiarizer: embeddingDiarizer,
             store: store,
-            startWallClock: sessionStart
+            startWallClock: sessionStart,
+            aec: host.aec
         )
 
         // 5. Print results (stdout) + summary; dropped detail to stderr.
@@ -228,12 +229,10 @@ enum SadiCLI {
 
     // MARK: - Mic test
 
-    /// Sandboxed end-to-end check of the live mic path: MicCapture (VPIO +
-    /// AEC) → resample → Apple ASR. Prints level stats and the transcript.
-    /// Diagnostic for exactly the failure modes App Sandbox can introduce
-    /// around VoiceProcessingIO (mach-lookup denials, silent capture).
+    /// Sandboxed end-to-end check of the live mic path: MicCapture (raw
+    /// AUHAL) → resample → Apple ASR. Prints level stats and the transcript.
     static func micTest(seconds: Double) async throws {
-        stderr("Recording \(seconds)s from the mic (VPIO voice processing on)…")
+        stderr("Recording \(seconds)s from the mic…")
         let mic = try MicCapture()
         stderr("  client rate: \(Int(mic.sampleRate)) Hz")
         try mic.start()
@@ -392,8 +391,8 @@ enum SadiCLI {
       rerun          Full regeneration from audio: offline VAD + batch ASR +
                      the finalize tail. WRITES transcript.json/session.json.
       mic            Diagnostic: record SECONDS (default 10) from the live
-                     MicCapture (VPIO echo cancellation on), print level
-                     stats and the ASR transcript. Nothing written to disk.
+                     MicCapture, print level stats and the ASR transcript.
+                     Nothing written to disk.
 
     ARGS:
       SESSION        Session id (e.g. 2026-05-28-14-03-09) or a path to a
