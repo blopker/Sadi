@@ -90,6 +90,40 @@ struct EchoCancellerTests {
         #expect(stats.processed > 0)
     }
 
+    @Test("delay refiner recovers from a large anchor error")
+    func delayRefinement() async throws {
+        guard let engine = Self.loadEngine() else { return }
+        let canceller = EchoCanceller(engine: engine)
+
+        // Anchors claim the streams are simultaneous, but the mic actually
+        // echoes the far end 900 ms late — far beyond what the model's
+        // adaptive filter can absorb. The envelope refiner has to find it.
+        let anchor = Date(timeIntervalSince1970: 2_000_000)
+        let farEnd = Self.signal(seconds: 30, seed: 5.0)
+        let delay = Int(0.9 * Double(Self.rate))
+        var mic = [Float](repeating: 0, count: farEnd.count)
+        for i in delay..<mic.count { mic[i] = 0.5 * farEnd[i - delay] }
+
+        var cleaned: [Float] = []
+        let chunk = Self.rate / 10
+        for start in stride(from: 0, to: farEnd.count, by: chunk) {
+            let end = min(start + chunk, farEnd.count)
+            await canceller.feedReference(Array(farEnd[start..<end]), anchor: anchor)
+            cleaned += await canceller.processMic(Array(mic[start..<end]), anchor: anchor)
+        }
+        cleaned += await canceller.flushMic()
+        #expect(cleaned.count == mic.count)
+
+        // The tail (after refinement + reconvergence) must be deeply
+        // suppressed even though the anchor-only alignment was hopeless.
+        let tail = cleaned.suffix(5 * Self.rate)
+        let tailIn = mic.suffix(5 * Self.rate)
+        let inRMS = Self.rms(tailIn[...])
+        let outRMS = Self.rms(tail[...])
+        #expect(inRMS > 0.05)
+        #expect(outRMS < inRMS * 0.15, "refined echo not suppressed: in \(inRMS) out \(outRMS)")
+    }
+
     @Test("mic-only: passes through with bounded latency, count preserved")
     func micOnlyPassthrough() async throws {
         guard let engine = Self.loadEngine() else { return }

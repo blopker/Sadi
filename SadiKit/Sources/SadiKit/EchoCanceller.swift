@@ -132,11 +132,36 @@ public actor EchoCanceller {
     /// passed through raw (reference stream stalled or absent): 3 s.
     private let maxReferenceWaitSamples: Int64 = 3 * Int64(Resampler.targetRate)
     /// Reference history floor kept behind the oldest queued mic sample —
-    /// generous slack for anchor error on either side.
-    private let referenceSlackSamples: Int64 = Int64(Resampler.targetRate)
+    /// must cover the refiner's negative search range plus slack.
+    private let referenceSlackSamples: Int64 = 3 * Int64(Resampler.targetRate)
 
     private var passthroughHops = 0
     private var processedHops = 0
+
+    // MARK: Delay refinement
+    //
+    // Anchors get the alignment into the right second; they cannot be
+    // trusted to the tens of milliseconds the AEC's adaptive filter needs
+    // (anchor stamping happens near — not at — each stream's sample 0, and
+    // a mis-timed stream upstream shifts everything). So the canceller
+    // *measures* the residual offset: 20 ms RMS envelopes of both streams,
+    // cross-correlated over the trailing window across ±2 s of candidate
+    // refinements, confidence-gated, and applied to future hops only.
+    // (Same approach Muesli ships; validated in scratch/localvqe-spike.)
+
+    /// Envelope frame: 20 ms at 16 kHz. Absolute frame indices are derived
+    /// from the samples-received counters (frames ever produced minus the
+    /// array length gives each array's base), so front-trimming is free.
+    private let envFrame = 320
+    private var micEnv: [Float] = []
+    private var micEnvCarry: [Float] = []
+    private var refEnv: [Float] = []
+    private var refEnvCarry: [Float] = []
+    /// Applied refinement, in samples, on top of the anchor offset.
+    private var refinedOffsetSamples: Int64 = 0
+    /// Recent accepted candidate refinements (frames), for consistency gating.
+    private var recentEstimates: [Int] = []
+    private var micFramesAtLastEstimate: Int = 0
 
     private static let log = Logger(subsystem: "io.kbl.sadi.Sadi", category: "aec")
 
@@ -146,16 +171,20 @@ public actor EchoCanceller {
     }
 
     /// Offset of the mic timeline into the reference timeline: the reference
-    /// sample index that plays at the same wall instant as mic sample 0.
+    /// sample index that plays at the same wall instant as mic sample 0,
+    /// anchor-derived plus the measured refinement.
     private var micToReferenceOffset: Int64? {
         guard let micAnchor, let referenceAnchor else { return nil }
-        return Int64((micAnchor.timeIntervalSince(referenceAnchor) * Resampler.targetRate).rounded())
+        let anchorOffset = Int64(
+            (micAnchor.timeIntervalSince(referenceAnchor) * Resampler.targetRate).rounded())
+        return anchorOffset + refinedOffsetSamples
     }
 
     /// Feed far-end (system tap) samples. `anchor` is the wall clock of the
     /// stream's sample 0; constant per stream, only read on first call.
     public func feedReference(_ samples: [Float], anchor: Date) {
         if referenceAnchor == nil { referenceAnchor = anchor }
+        appendEnvelope(samples, env: &refEnv, carry: &refEnvCarry)
         reference.append(contentsOf: samples)
         referenceSamplesReceived += Int64(samples.count)
         trimReference()
@@ -167,8 +196,10 @@ public actor EchoCanceller {
     /// `flushMic()` at end of stream for the tail.
     public func processMic(_ samples: [Float], anchor: Date) -> [Float] {
         if micAnchor == nil { micAnchor = anchor }
+        appendEnvelope(samples, env: &micEnv, carry: &micEnvCarry)
         pendingMic.append(contentsOf: samples)
         micSamplesReceived += Int64(samples.count)
+        refineOffsetIfDue()
         return drain(force: false)
     }
 
@@ -254,6 +285,98 @@ public actor EchoCanceller {
         pendingMicStart += Int64(n)
         passthroughHops += n / max(1, hop)
         return out
+    }
+
+    // MARK: - Delay refinement internals
+
+    private func appendEnvelope(_ samples: [Float], env: inout [Float], carry: inout [Float]) {
+        carry.append(contentsOf: samples)
+        var i = 0
+        while i + envFrame <= carry.count {
+            var s: Float = 0
+            for j in i..<(i + envFrame) { s += carry[j] * carry[j] }
+            env.append((s / Float(envFrame)).squareRoot())
+            i += envFrame
+        }
+        carry.removeFirst(i)
+        // Cap envelope history at ~40 s (2000 frames) per side.
+        let cap = 2000
+        if env.count > cap {
+            env.removeFirst(env.count - cap)
+        }
+    }
+
+    /// Re-estimate the residual offset every ~4 s of mic audio, over the
+    /// trailing ~16 s, searching ±2 s around the current total offset.
+    /// Accepted only on confident, consistent estimates; applied to future
+    /// hops (the model's adaptive filter reconverges in ~0.3 s).
+    private func refineOffsetIfDue() {
+        guard micAnchor != nil, referenceAnchor != nil else { return }
+        let estimateEveryFrames = 200  // 4 s
+        guard micEnv.count - micFramesAtLastEstimate >= estimateEveryFrames else { return }
+        micFramesAtLastEstimate = micEnv.count
+
+        guard let offset = micToReferenceOffset else { return }
+        let offsetFrames = Int(offset) / envFrame
+
+        let windowFrames = min(800, micEnv.count)  // ≤16 s
+        let micLo = micEnv.count - windowFrames
+        let searchFrames = 100  // ±2 s
+
+        // Active gating on the reference: only frames with real far-end
+        // energy participate, so silence doesn't reward every candidate.
+        let refPeak = refEnv.suffix(windowFrames + 2 * searchFrames).max() ?? 0
+        guard refPeak > 1e-4 else { return }
+        let active = 0.15 * refPeak
+
+        var best = (refinement: 0, score: -1.0)
+        var zeroScore = -1.0
+        // Envelope-frame indexing: micEnv is trimmed from the front, so map
+        // local index → absolute frame via the counts consumed so far.
+        let micAbsBase = Int(micSamplesReceived) / envFrame - micEnv.count
+        let refAbsBase = Int(referenceSamplesReceived) / envFrame - refEnv.count
+        for r in -searchFrames...searchFrames {
+            var num = 0.0, denM = 0.0, denR = 0.0
+            var count = 0
+            for k in micLo..<micEnv.count {
+                let refAbs = (micAbsBase + k) + offsetFrames + r
+                let refLocal = refAbs - refAbsBase
+                guard refLocal >= 0, refLocal < refEnv.count else { continue }
+                let rv = Double(refEnv[refLocal])
+                guard rv > Double(active) else { continue }
+                let mv = Double(micEnv[k])
+                num += mv * rv
+                denM += mv * mv
+                denR += rv * rv
+                count += 1
+            }
+            guard count > 100, denM > 0, denR > 0 else { continue }
+            let score = num / (denM.squareRoot() * denR.squareRoot())
+            if r == 0 { zeroScore = score }
+            if score > best.score { best = (r, score) }
+        }
+
+        guard best.score >= 0.55 else { return }
+        // Keep the current alignment unless the winner clearly beats it.
+        if best.refinement != 0 && zeroScore > 0 && best.score - zeroScore < 0.05 { return }
+
+        recentEstimates.append(best.refinement)
+        if recentEstimates.count > 5 { recentEstimates.removeFirst() }
+        // Consistency: at least 2 of the last 3 estimates within 100 ms of
+        // the newest before we move.
+        let recent = recentEstimates.suffix(3)
+        let agreeing = recent.filter { abs($0 - best.refinement) <= 5 }.count
+        guard agreeing >= 2 || recentEstimates.count == 1 else { return }
+        guard best.refinement != 0 else { return }
+
+        let shift = Int64(best.refinement * envFrame)
+        refinedOffsetSamples += shift
+        // The applied shift moves the mapping; recorded estimates are
+        // relative to the *old* offset, so rebase them.
+        recentEstimates = recentEstimates.map { $0 - best.refinement }
+        Self.log.notice(
+            "AEC delay refined by \(Double(shift) / Resampler.targetRate * 1000, format: .fixed(precision: 0)) ms (total \(Double(self.refinedOffsetSamples) / Resampler.targetRate * 1000, format: .fixed(precision: 0)) ms, score \(best.score, format: .fixed(precision: 2)))"
+        )
     }
 
     private func trimReference() {

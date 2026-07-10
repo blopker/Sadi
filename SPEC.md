@@ -136,6 +136,8 @@ Capacity per ring: sized for the maximum tolerated end-to-end consumer latency. 
 
 ### 5.2 System Audio Capture (`SystemAudioCapture`)
 
+> **Wall-clock lock:** process taps stall when no process is playing audio and deliver stale catch-up bursts after route churn. The IOProc back-fills host-time gaps with silence and drops stale bursts (same scheme as §5.1's mic path), keeping the ring's sample count locked to wall-clock — without this the stream timeline warps by seconds, breaking AEC alignment and utterance timestamps. The effective-rate retune (§ Phase 9) additionally rejects readings >2% off nominal: it exists for sub-percent clock drift, and burst-polluted measurements (a transient 72 kHz reading on a 48 kHz tap was observed) must never rebuild the resampler.
+
 - **Framework:** **CoreAudio process tap**, not ScreenCaptureKit. Specifically:
   - `AudioHardwareCreateProcessTap` with `kAudioSubTapMixdown` (or its mono variant) to get a single-channel mix of system output.
   - `AudioHardwareCreateAggregateDevice` wrapping the tap, with `kAudioSubTapDriftCompensationKey: true` so the OS handles clock drift between the tap and the output device.
@@ -182,7 +184,7 @@ Backpressure: the ring is bounded. If `ring.push(...)` returns `false` (full) �
 ### 6.2a Acoustic Echo Cancellation (`EchoCanceller`, call mode)
 
 - **Model:** LocalVQE **v1.4-AEC** (203 K params, echo-only: passes near-end voice, noise, and room through — keeps WeSpeaker embeddings trustworthy), GGUF via `liblocalvqe.dylib` (GGML, CPU, ~22x realtime). Vendored in `Vendor/localvqe/`; rebuild with `scripts/build-localvqe.sh`.
-- **Reference:** the system-audio stream — the same 16 kHz samples the system `StreamProcessor` consumes. Alignment is wall-clock: each stream declares its sample-0 anchor; the canceller maps mic sample i to reference sample j by anchor delta. The residual acoustic delay (~40–100 ms) is absorbed by the model's adaptive-filter front-end.
+- **Reference:** the system-audio stream — the same 16 kHz samples the system `StreamProcessor` consumes. Alignment is wall-clock (each stream declares its sample-0 anchor) **plus a measured refinement**: anchors get into the right second, but the AEC needs tens of milliseconds, so the canceller cross-correlates 20 ms RMS envelopes of both streams every ~4 s (±2 s search, confidence- and consistency-gated) and applies the residual offset to future hops. The remaining acoustic delay is absorbed by the model's adaptive-filter front-end. Never trust anchors alone — a 1.6 s real-world anchor error broke AEC entirely before the refiner existed.
 - **Placement:** mic path only, post-resample, pre-VAD — VAD, diarizer, ASR, and embeddings all consume *cleaned* audio. The canceller preserves sample count/order, so cleaned-stream indices equal raw-stream indices and all wall-clock math is unchanged. **Archives stay raw** — a rerun re-derives the cleaned mic from the pristine recording (and benefits from future model upgrades).
 - **Degradation:** missing model/dylib, mic-only mode, or a stalled reference stream → bounded buffering then raw passthrough. AEC is an enhancement, never a gate; §7's text filter remains the backstop (it eats ASR output from the model's quiet residual, deliberately un-gated because a hard noise gate would eat quiet real speech).
 - The offline pipeline (§ finalize/rerun) runs the same stage batch, before diarization, so echo cannot seed phantom mic clusters.

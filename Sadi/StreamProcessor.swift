@@ -85,9 +85,24 @@ actor StreamProcessor {
     /// process taps exhibit without thrashing on micro-jitter. The 16 kHz
     /// downstream state (VAD stream, ASR window, diarizer timeline) is
     /// untouched because the *output* rate is unchanged.
+    ///
+    /// `maxPlausibleDelta` rejects measurement artifacts outright: this
+    /// mechanism exists for sub-percent clock drift, but a tap's catch-up
+    /// burst after a stall can make the delivered-frames/wall-clock ratio
+    /// read wildly wrong for a while (observed: a transient 72 kHz reading
+    /// on a 48 kHz tap that rebuilt the resampler 50% off and corrupted the
+    /// stream timeline). No real device drifts 2%; ignore such readings and
+    /// let the measurement settle.
     func retuneSourceRate(_ measuredRate: Double, threshold: Double = 0.002) {
         guard measuredRate > 0 else { return }
+        let maxPlausibleDelta = 0.02
         let relativeDelta = abs(measuredRate - resamplerSourceRate) / resamplerSourceRate
+        guard relativeDelta <= maxPlausibleDelta else {
+            Self.log.warning(
+                "Ignoring implausible effective-rate reading \(measuredRate, format: .fixed(precision: 1)) Hz (bound \(self.resamplerSourceRate, format: .fixed(precision: 1)) Hz, Δ \(relativeDelta * 100, format: .fixed(precision: 1))%)"
+            )
+            return
+        }
         guard relativeDelta > threshold else { return }
         do {
             self.resampler = try Resampler(sourceRate: measuredRate, maxInputFrames: 2048)
