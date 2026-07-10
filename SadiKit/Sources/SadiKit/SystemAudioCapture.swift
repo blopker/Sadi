@@ -3,6 +3,22 @@ import Foundation
 import OSLog
 import Synchronization
 
+/// Convert a `mach_absolute_time` host time to a wall-clock `Date`, via the
+/// current instant. Used to anchor a capture stream at its *first delivered
+/// frame* — for process taps that frame can be minutes after `start()`
+/// (nothing is delivered until some process plays audio), so stamping
+/// `Date()` at start would shift the stream's whole timeline by the length
+/// of the leading silence.
+public enum HostClock {
+    public static func date(atHostTime hostTime: UInt64) -> Date {
+        let now = mach_absolute_time()
+        if hostTime <= now {
+            return Date().addingTimeInterval(-SystemAudioCapture.hostTimeSeconds(from: hostTime, to: now))
+        }
+        return Date().addingTimeInterval(SystemAudioCapture.hostTimeSeconds(from: now, to: hostTime))
+    }
+}
+
 /// System-audio capture per SPEC §5.2.
 ///
 /// CoreAudio process tap (macOS 14.4+) wrapped in a private aggregate device
