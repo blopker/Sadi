@@ -194,7 +194,7 @@ final class TranscriptionJobs {
             at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         else { return [] }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
         var pending: [URL] = []
         for dir in dirs {
             let url = dir.appending(path: "session.json", directoryHint: .notDirectory)

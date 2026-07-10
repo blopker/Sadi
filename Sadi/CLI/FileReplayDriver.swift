@@ -11,11 +11,15 @@ import SadiKit
 /// diarization, ASR, labeling, echo filtering, voiceprint resolution — is the
 /// exact same code path the GUI runs.
 enum FileReplayDriver {
-    /// One decoded track ready to feed.
+    /// One decoded track ready to feed. `anchor` is the wall clock of the
+    /// track's sample 0 (from session.json) — the system file can start
+    /// minutes after the mic's (its capture anchors at the first delivered
+    /// frame), so replay must offset the feeds the same way live capture did.
     struct Track {
         let source: Source
         let samples: [Float]
         let sampleRate: Double
+        let anchor: Date
     }
 
     /// Decode an audio file to mono Float32 at its native sample rate. The
@@ -63,12 +67,10 @@ enum FileReplayDriver {
         diarizerModel: LSEENDModel,
         embeddingDiarizer: DiarizerManager,
         store: TranscriptStore,
-        startWallClock: Date,
         aec: LocalVQE? = nil
     ) async throws {
         // Same AEC wiring as the live CaptureController: one canceller per
-        // replay, mic cleaned against the system track. Both replay streams
-        // share `startWallClock` as their anchor, so alignment is exact.
+        // replay, mic cleaned against the system track, per-track anchors.
         let canceller: EchoCanceller? =
             tracks.contains { $0.source == .system } ? aec.map { EchoCanceller(engine: $0) } : nil
 
@@ -83,7 +85,7 @@ enum FileReplayDriver {
                 diarizerModel: diarizerModel,
                 embeddingDiarizer: embeddingDiarizer,
                 store: store,
-                startWallClock: startWallClock,
+                startWallClock: track.anchor,
                 echoCanceller: canceller
             )
             return (proc, track)
@@ -91,14 +93,22 @@ enum FileReplayDriver {
 
         // ~20 ms per step keeps the interleave fine-grained and each per-track
         // chunk comfortably under the resampler's input cap at any sane rate.
+        // The wall clock runs from the earliest anchor; each track starts
+        // feeding at its own anchor offset, mirroring live capture order.
         let stepSeconds = 0.02
-        let totalSeconds = tracks.map { Double($0.samples.count) / $0.sampleRate }.max() ?? 0
+        guard let wallStart = tracks.map(\.anchor).min() else { return }
+        let totalSeconds = tracks.map {
+            $0.anchor.timeIntervalSince(wallStart) + Double($0.samples.count) / $0.sampleRate
+        }.max() ?? 0
         var elapsed = 0.0
         while elapsed < totalSeconds {
             let nextElapsed = elapsed + stepSeconds
             for (proc, track) in processors {
-                let lo = Int(elapsed * track.sampleRate)
-                let hi = min(Int(nextElapsed * track.sampleRate), track.samples.count)
+                let trackStart = track.anchor.timeIntervalSince(wallStart)
+                let lo = max(0, Int((elapsed - trackStart) * track.sampleRate))
+                let hi = min(
+                    max(0, Int((nextElapsed - trackStart) * track.sampleRate)),
+                    track.samples.count)
                 guard hi > lo else { continue }
                 await proc.feed(Array(track.samples[lo..<hi]))
             }

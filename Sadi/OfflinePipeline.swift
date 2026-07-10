@@ -117,19 +117,53 @@ enum OfflinePipeline {
         // every pass re-derives the cleaned mic from scratch (benefiting from
         // whatever model ships at that time). Best-effort: without the engine
         // the pass proceeds on raw mic + the text-level echo filter.
-        if let aec = modelHost.aec,
+        let aecLocations = modelHost.aecLocations
+        if aecLocations != nil,
            let micIdx = tracks.firstIndex(where: { $0.source == .mic }),
            let sys = tracks.first(where: { $0.source == .system }) {
             progress("Cancelling echo…")
             let micTrack = tracks[micIdx]
-            let cleaned = try await hop {
-                let canceller = EchoCanceller(engine: aec)
-                await canceller.feedReference(sys.samples, anchor: sys.anchor)
-                var out = await canceller.processMic(micTrack.samples, anchor: micTrack.anchor)
+            let cleaned = try await hop { () -> [Float]? in
+                // Own engine instance: a LocalVQE context carries streaming
+                // state and must not be shared with a concurrent live session.
+                guard let engine = ModelHost.makeAEC(locations: aecLocations) else { return nil }
+                let canceller = EchoCanceller(engine: engine)
+                let rate = Resampler.targetRate
+                // Interleave the feeds in wall-clock order, ~10 s at a time.
+                // Feeding the whole reference up front would trip the
+                // canceller's retention cap (it keeps only what queued mic
+                // can still need); interleaving keeps the reference window
+                // live, memory bounded, and gives the delay refiner its
+                // periodic re-estimates, exactly like the live pipeline.
+                let chunk = Int(rate) * 10
+                // Reference index that plays at the same instant as a given
+                // mic index, per the anchors (the canceller re-derives this
+                // internally; here it only sizes the feed-ahead).
+                let offset = Int((micTrack.anchor.timeIntervalSince(sys.anchor) * rate).rounded())
+                var out: [Float] = []
+                out.reserveCapacity(micTrack.samples.count)
+                var refFed = 0
+                var i = 0
+                while i < micTrack.samples.count {
+                    try Task.checkCancellation()
+                    let end = min(i + chunk, micTrack.samples.count)
+                    // Keep the reference fed ~1 s past this mic chunk's end.
+                    let refNeed = max(0, min(sys.samples.count, end + offset + Int(rate)))
+                    if refNeed > refFed {
+                        await canceller.feedReference(
+                            Array(sys.samples[refFed..<refNeed]), anchor: sys.anchor)
+                        refFed = refNeed
+                    }
+                    out += await canceller.processMic(
+                        Array(micTrack.samples[i..<end]), anchor: micTrack.anchor)
+                    i = end
+                }
                 out += await canceller.flushMic()
                 return out
             }
-            tracks[micIdx] = Track(source: .mic, anchor: micTrack.anchor, samples: cleaned)
+            if let cleaned {
+                tracks[micIdx] = Track(source: .mic, anchor: micTrack.anchor, samples: cleaned)
+            }
         }
 
         // Post-AEC track set is immutable from here; snapshot for the
@@ -295,7 +329,7 @@ enum OfflinePipeline {
         let url = directory.appending(path: "session.json", directoryHint: .notDirectory)
         guard let data = try? Data(contentsOf: url) else { throw Failure.noSessionMetadata }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
         return try decoder.decode(Session.self, from: data)
     }
 

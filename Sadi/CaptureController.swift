@@ -120,11 +120,12 @@ final class CaptureController {
         // through the normal path.
         do {
             let micURL = paths.micURL(segment: 1)
+            let aecLocations = modelHost.aecLocations
             // The anchor is the stream's sample-0 wall clock; stamping it
             // right after the unit starts (rather than at session start) keeps
             // utterance timestamps honest even when bring-up blocked for a
             // second on a balky device.
-            let (mic, micWriter, anchor) = try await Task.detached(priority: .userInitiated) {
+            let (mic, micWriter, anchor, aecEngine) = try await Task.detached(priority: .userInitiated) {
                 let m = try MicCapture()
                 let w = try SegmentArchiveWriter(url: micURL, sampleRate: m.sampleRate)
                 try m.start()
@@ -139,12 +140,16 @@ final class CaptureController {
                     }
                     try? await Task.sleep(for: .milliseconds(50))
                 }
-                return (m, w, anchor)
+                // Fresh AEC engine per session (a LocalVQE context carries
+                // streaming state that must not be shared with a concurrent
+                // offline pass); built here to keep dlopen/GGUF work off main.
+                let engine = ModelHost.makeAEC(locations: aecLocations)
+                return (m, w, anchor, engine)
             }.value
             do {
                 // One canceller per session; nil when the engine didn't load
                 // (mic then runs raw and the text-level echo filter carries).
-                session.echoCanceller = modelHost.aec.map { EchoCanceller(engine: $0) }
+                session.echoCanceller = aecEngine.map { EchoCanceller(engine: $0) }
                 let processor = try StreamProcessor(
                     source: .mic,
                     sourceRate: mic.sampleRate,
@@ -194,16 +199,11 @@ final class CaptureController {
         // producing audio. Opening the mic input can kick off a Bluetooth
         // A2DP→HFP profile switch that churns CoreAudio for ~1 s; creating the
         // system process tap during that window corrupts it (-10877 storms, a
-        // collapsed effective rate). The mic's first delivered frame signals
-        // the input device (and any profile switch) has settled.
+        // collapsed effective rate). The mic-anchor wait during bring-up
+        // already blocked on the mic's first delivered frame (same ~2 s
+        // bound), so by the time this task runs the input path has settled.
         session.systemStartTask = Task { [weak self] in
             guard let self else { return }
-            let mic = session.pipeline(for: .mic)?.capture
-            for _ in 0..<40 {  // up to ~2 s
-                if Task.isCancelled { return }
-                if mic?.firstHostTime != nil { break }
-                try? await Task.sleep(for: .milliseconds(50))
-            }
             guard !Task.isCancelled, self.phase == .recording else { return }
             await self.startSystemPipeline(in: session)
         }

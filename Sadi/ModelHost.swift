@@ -32,10 +32,14 @@ final class ModelHost {
     private(set) var state: LoadState = .idle
     private(set) var vad: VadManager?
     private(set) var asr: AppleAsr?
-    /// LocalVQE echo-cancellation engine (v1.4-AEC). Optional: when the
-    /// dylib/model can't be loaded the pipeline runs without acoustic AEC
-    /// (the text-level EchoFilter remains), so load failure is non-fatal.
-    private(set) var aec: LocalVQE?
+    /// Validated LocalVQE dylib/model locations, set during `loadIfNeeded`.
+    /// `nil` when the engine can't be loaded — the pipeline then runs
+    /// without acoustic AEC (the text-level EchoFilter remains), so load
+    /// failure is non-fatal. Consumers construct their own engine instance
+    /// per use via `makeAEC()`: a LocalVQE context carries per-stream
+    /// adaptive-filter state, so a live session and a concurrent offline
+    /// pass must never share one.
+    private(set) var aecLocations: (library: URL, model: URL)?
     private(set) var diarizerModel: LSEENDModel?
     private(set) var embeddingDiarizer: DiarizerManager?
     /// Offline (batch) diarization model set — loaded lazily on the first
@@ -76,22 +80,39 @@ final class ModelHost {
     /// in Frameworks (code-signed on copy), model in Resources. The env var
     /// override serves headless/dev runs outside a full bundle.
     nonisolated static func localVQELocations() -> (library: URL, model: URL)? {
-        let modelName = "localvqe-v1.4-aec-200K-f32.gguf"
-        let fm = FileManager.default
-        var candidates: [(URL, URL)] = []
+        func locate(library: URL, model: URL) -> (URL, URL)? {
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: library.path(percentEncoded: false)),
+                  fm.fileExists(atPath: model.path(percentEncoded: false))
+            else { return nil }
+            return (library, model)
+        }
         if let dir = ProcessInfo.processInfo.environment["SADI_LOCALVQE_DIR"] {
             let d = URL(fileURLWithPath: dir, isDirectory: true)
-            candidates.append((d.appending(path: "liblocalvqe.dylib"), d.appending(path: modelName)))
+            if let found = locate(
+                library: d.appending(path: LocalVQE.libraryFilename),
+                model: d.appending(path: LocalVQE.modelFilename)) {
+                return found
+            }
         }
-        if let fw = Bundle.main.privateFrameworksURL, let res = Bundle.main.resourceURL {
-            candidates.append((
-                fw.appending(path: "liblocalvqe.dylib"),
-                res.appending(path: modelName)
-            ))
+        guard let fw = Bundle.main.privateFrameworksURL, let res = Bundle.main.resourceURL else {
+            return nil
         }
-        return candidates.first { lib, model in
-            fm.fileExists(atPath: lib.path(percentEncoded: false))
-                && fm.fileExists(atPath: model.path(percentEncoded: false))
+        return locate(
+            library: fw.appending(path: LocalVQE.libraryFilename),
+            model: res.appending(path: LocalVQE.modelFilename))
+    }
+
+    /// Build a fresh LocalVQE engine (one per canceller/session). ~10 ms of
+    /// dlopen + GGUF parse — call off the main actor. Returns nil (logged)
+    /// when the engine is unavailable.
+    nonisolated static func makeAEC(locations: (library: URL, model: URL)?) -> LocalVQE? {
+        guard let locations else { return nil }
+        do {
+            return try LocalVQE(libraryURL: locations.library, modelURL: locations.model)
+        } catch {
+            Self.log.error("LocalVQE engine construction failed: \(String(describing: error), privacy: .public)")
+            return nil
         }
     }
 
@@ -140,15 +161,15 @@ final class ModelHost {
             self.asr = asr
             state = .loading(fraction: 0.96, phase: "Loading echo canceller")
 
-            // LocalVQE AEC — bundled, loads in tens of ms. Non-fatal: without
-            // it the mic path runs raw and the text-level echo filter carries
-            // the load alone.
-            if let (lib, model) = Self.localVQELocations() {
-                do {
-                    self.aec = try LocalVQE(libraryURL: lib, modelURL: model)
-                } catch {
-                    Self.log.error("LocalVQE load failed (continuing without AEC): \(String(describing: error), privacy: .public)")
-                }
+            // LocalVQE AEC — bundled. Validate once (off-main: dlopen + GGUF
+            // parse) and remember the locations; consumers build their own
+            // engine per session via `makeAEC`. Non-fatal: without it the mic
+            // path runs raw and the text-level echo filter carries alone.
+            if let locations = Self.localVQELocations() {
+                let ok = await Task.detached(priority: .userInitiated) {
+                    Self.makeAEC(locations: locations) != nil
+                }.value
+                if ok { self.aecLocations = locations }
             } else {
                 Self.log.error("LocalVQE dylib/model not found (continuing without AEC)")
             }

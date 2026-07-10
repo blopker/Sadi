@@ -12,10 +12,9 @@ import Synchronization
 public enum HostClock {
     public static func date(atHostTime hostTime: UInt64) -> Date {
         let now = mach_absolute_time()
-        if hostTime <= now {
-            return Date().addingTimeInterval(-SystemAudioCapture.hostTimeSeconds(from: hostTime, to: now))
-        }
-        return Date().addingTimeInterval(SystemAudioCapture.hostTimeSeconds(from: now, to: hostTime))
+        let seconds = SystemAudioCapture.hostTimeSeconds(
+            from: min(hostTime, now), to: max(hostTime, now))
+        return Date().addingTimeInterval(hostTime <= now ? -seconds : seconds)
     }
 }
 
@@ -69,6 +68,10 @@ public final class SystemAudioCapture: @unchecked Sendable {
     private let hostTicksPerSample: Double
     /// Pre-allocated zeros for realtime-safe gap fill.
     private let silence = [Float](repeating: 0, count: 4096)
+    /// Stale catch-up-burst frames discarded by the wall-clock lock.
+    /// Diagnostic only — deliberately separate from `droppedFrames` (whose
+    /// consumer contract back-fills silence) and `framesDelivered` (rate).
+    private let staleDropsAtomic = Atomic<UInt64>(0)
     /// Frames the IOProc failed to push because the ring was full. Monotonic
     /// per `start()`. See `MicCapture.droppedFrames` for the consumer contract.
     private let droppedFramesAtomic = Atomic<UInt64>(0)
@@ -238,6 +241,7 @@ public final class SystemAudioCapture: @unchecked Sendable {
         lastHostTimeAtomic.store(0, ordering: .releasing)
         nextExpectedHostTimeAtomic.store(0, ordering: .releasing)
         droppedFramesAtomic.store(0, ordering: .releasing)
+        staleDropsAtomic.store(0, ordering: .releasing)
 
         var proc: AudioDeviceIOProcID?
         // Weak self: CoreAudio retains the IOProc block for the lifetime of
@@ -274,14 +278,22 @@ public final class SystemAudioCapture: @unchecked Sendable {
                     if hostTime > expected {
                         // Tap stalled (nothing was playing): back-fill the
                         // gap with silence so the sample count keeps tracking
-                        // wall-clock. Sub-buffer jitter is ignored.
+                        // wall-clock. Sub-buffer jitter is ignored. The fill
+                        // counts as delivered frames: they ARE timeline
+                        // samples, and excluding them would make the
+                        // effective-rate measurement read low after every
+                        // stall (and mis-retune the resampler downstream).
                         var gap = Int(Double(hostTime - expected) / hostTicksPerSample)
                         if gap > frames {
+                            framesDeliveredAtomic.add(UInt64(gap), ordering: .relaxed)
                             silence.withUnsafeBufferPointer { sil in
                                 while gap > 0 {
                                     let c = min(gap, sil.count)
                                     guard ring.push(data: UnsafeBufferPointer(start: sil.baseAddress, count: c))
                                     else {
+                                        // Unfillable remainder: account as
+                                        // ring loss so the consumer restores
+                                        // the timeline with its own silence.
                                         droppedFramesAtomic.add(UInt64(gap), ordering: .relaxed)
                                         break
                                     }
@@ -295,11 +307,17 @@ public final class SystemAudioCapture: @unchecked Sendable {
                         // already covered with silence. Pushing it would run
                         // the count ahead of wall-clock — drop it entirely
                         // once it's more than a buffer stale (small overlaps
-                        // are timestamp jitter; keep those).
+                        // are timestamp jitter; keep those). Deliberately NOT
+                        // counted in droppedFrames: the consumer back-fills
+                        // droppedFrames with silence, and this span is
+                        // already represented in the timeline — counting it
+                        // would double-insert and run the archive AHEAD of
+                        // wall-clock (and could trip the stall failsafe).
+                        // Not counted in framesDelivered either: duplicates
+                        // would inflate the effective-rate measurement.
                         let staleness = Int(Double(expected - hostTime) / hostTicksPerSample)
                         if staleness > frames {
-                            droppedFramesAtomic.add(UInt64(frames), ordering: .relaxed)
-                            framesDeliveredAtomic.add(UInt64(frames), ordering: .relaxed)
+                            staleDropsAtomic.add(UInt64(frames), ordering: .relaxed)
                             lastHostTimeAtomic.store(hostTime, ordering: .releasing)
                             return
                         }

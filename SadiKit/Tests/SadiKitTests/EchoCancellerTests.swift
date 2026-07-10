@@ -18,8 +18,8 @@ struct EchoCancellerTests {
                 .appending(path: "Vendor/localvqe"),
         ]
         for dir in candidates {
-            let lib = dir.appending(path: "liblocalvqe.dylib")
-            let model = dir.appending(path: "localvqe-v1.4-aec-200K-f32.gguf")
+            let lib = dir.appending(path: LocalVQE.libraryFilename)
+            let model = dir.appending(path: LocalVQE.modelFilename)
             if FileManager.default.fileExists(atPath: lib.path(percentEncoded: false)),
                 FileManager.default.fileExists(atPath: model.path(percentEncoded: false)) {
                 return try? LocalVQE(libraryURL: lib, modelURL: model)
@@ -86,8 +86,6 @@ struct EchoCancellerTests {
         #expect(inRMS > 0.05)
         #expect(outRMS < inRMS * 0.1, "echo not suppressed: in \(inRMS) out \(outRMS)")
 
-        let stats = await canceller.stats()
-        #expect(stats.processed > 0)
     }
 
     @Test("delay refiner recovers from a large anchor error")

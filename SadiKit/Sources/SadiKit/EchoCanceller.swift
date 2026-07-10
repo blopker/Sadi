@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import OSLog
 
@@ -18,6 +19,11 @@ import OSLog
 ///
 /// Sample rates: everything here is the pipeline's 16 kHz mono Float32.
 public final class LocalVQE: @unchecked Sendable {
+    /// Canonical file names — the single definition shared by the app's
+    /// bundle locator and the test fixtures.
+    public static let libraryFilename = "liblocalvqe.dylib"
+    public static let modelFilename = "localvqe-v1.4-aec-200K-f32.gguf"
+
     public enum Error: Swift.Error, LocalizedError {
         case libraryLoadFailed(String)
         case symbolMissing(String)
@@ -135,9 +141,6 @@ public actor EchoCanceller {
     /// must cover the refiner's negative search range plus slack.
     private let referenceSlackSamples: Int64 = 3 * Int64(Resampler.targetRate)
 
-    private var passthroughHops = 0
-    private var processedHops = 0
-
     // MARK: Delay refinement
     //
     // Anchors get the alignment into the right second; they cannot be
@@ -168,6 +171,9 @@ public actor EchoCanceller {
     public init(engine: LocalVQE) {
         self.engine = engine
         self.hop = engine.hopLength
+        // Each canceller expects virgin streaming state; clear anything a
+        // previous user of this engine instance left behind.
+        engine.reset()
     }
 
     /// Offset of the mic timeline into the reference timeline: the reference
@@ -208,28 +214,26 @@ public actor EchoCanceller {
         drain(force: true)
     }
 
-    public func stats() -> (processed: Int, passthrough: Int) {
-        (processedHops, passthroughHops)
-    }
-
     private func drain(force: Bool) -> [Float] {
         guard let offset = micToReferenceOffset else {
             // No reference stream yet (mic-only mode, or system not up):
-            // hold up to the wait bound, then pass through. Hold in *hop*
-            // units so a late-starting system stream begins cleanly.
-            if force || Int64(pendingMic.count) > maxReferenceWaitSamples {
-                return passthrough(upTo: force ? pendingMic.count : pendingMic.count - Int(maxReferenceWaitSamples / 2))
-            }
-            return []
+            // pass through immediately. Holding would only add latency —
+            // samples from before the reference stream's sample 0 map to
+            // negative reference indices and zero-fill (passthrough) anyway.
+            return passthrough(upTo: pendingMic.count)
         }
 
         var out: [Float] = []
-        var micBuf = [Float](repeating: 0, count: hop)
         var refBuf = [Float](repeating: 0, count: hop)
         var outBuf = [Float](repeating: 0, count: hop)
+        // Local read cursor into pendingMic; consumed samples are removed in
+        // ONE removeFirst after the loop (per-hop removeFirst is O(n) each,
+        // quadratic over a batch-fed track).
+        var cursor = 0
 
-        while pendingMic.count >= hop {
-            let hopStartInRef = pendingMicStart + offset
+        while pendingMic.count - cursor >= hop {
+            let hopStart = pendingMicStart + Int64(cursor)
+            let hopStartInRef = hopStart + offset
             let hopEndInRef = hopStartInRef + Int64(hop)
 
             if hopEndInRef > referenceSamplesReceived {
@@ -237,36 +241,36 @@ public actor EchoCanceller {
                 // exceeded or we're flushing, in which case zero-fill the
                 // missing reference (the model treats silence as "no echo",
                 // which degrades to passthrough behavior for that span).
-                let waited = micSamplesReceived - pendingMicStart
+                let waited = Int64(pendingMic.count - cursor)
                 if !force && waited <= maxReferenceWaitSamples { break }
             }
 
-            for i in 0..<hop { micBuf[i] = pendingMic[i] }
             let lo = hopStartInRef - referenceStart
             for i in 0..<hop {
                 let j = lo + Int64(i)
                 refBuf[i] = (j >= 0 && j < Int64(reference.count)) ? reference[Int(j)] : 0
             }
 
-            let ok = micBuf.withUnsafeBufferPointer { mp in
+            let ok = pendingMic.withUnsafeBufferPointer { mp in
                 refBuf.withUnsafeBufferPointer { rp in
                     outBuf.withUnsafeMutableBufferPointer { op in
                         engine.processHop(
-                            mic: mp.baseAddress!, reference: rp.baseAddress!,
+                            mic: mp.baseAddress! + cursor, reference: rp.baseAddress!,
                             into: op.baseAddress!)
                     }
                 }
             }
             if ok {
                 out.append(contentsOf: outBuf)
-                processedHops += 1
             } else {
                 Self.log.error("AEC hop failed (\(self.engine.lastError, privacy: .public)); passing raw")
-                out.append(contentsOf: micBuf)
-                passthroughHops += 1
+                out.append(contentsOf: pendingMic[cursor..<(cursor + hop)])
             }
-            pendingMic.removeFirst(hop)
-            pendingMicStart += Int64(hop)
+            cursor += hop
+        }
+        if cursor > 0 {
+            pendingMic.removeFirst(cursor)
+            pendingMicStart += Int64(cursor)
         }
 
         if force && !pendingMic.isEmpty {
@@ -283,7 +287,6 @@ public actor EchoCanceller {
         let out = Array(pendingMic.prefix(n))
         pendingMic.removeFirst(n)
         pendingMicStart += Int64(n)
-        passthroughHops += n / max(1, hop)
         return out
     }
 
@@ -292,11 +295,13 @@ public actor EchoCanceller {
     private func appendEnvelope(_ samples: [Float], env: inout [Float], carry: inout [Float]) {
         carry.append(contentsOf: samples)
         var i = 0
-        while i + envFrame <= carry.count {
-            var s: Float = 0
-            for j in i..<(i + envFrame) { s += carry[j] * carry[j] }
-            env.append((s / Float(envFrame)).squareRoot())
-            i += envFrame
+        carry.withUnsafeBufferPointer { buf in
+            while i + envFrame <= buf.count {
+                var rms: Float = 0
+                vDSP_rmsqv(buf.baseAddress! + i, 1, &rms, vDSP_Length(envFrame))
+                env.append(rms)
+                i += envFrame
+            }
         }
         carry.removeFirst(i)
         // Cap envelope history at ~40 s (2000 frames) per side.
@@ -313,8 +318,12 @@ public actor EchoCanceller {
     private func refineOffsetIfDue() {
         guard micAnchor != nil, referenceAnchor != nil else { return }
         let estimateEveryFrames = 200  // 4 s
-        guard micEnv.count - micFramesAtLastEstimate >= estimateEveryFrames else { return }
-        micFramesAtLastEstimate = micEnv.count
+        // Gate on CUMULATIVE frames produced, not the array length — micEnv
+        // is capped, so its count stops growing after ~40 s and an
+        // array-length gate would silence the refiner for good.
+        let framesProduced = Int(micSamplesReceived) / envFrame
+        guard framesProduced - micFramesAtLastEstimate >= estimateEveryFrames else { return }
+        micFramesAtLastEstimate = framesProduced
 
         guard let offset = micToReferenceOffset else { return }
         let offsetFrames = Int(offset) / envFrame
@@ -392,10 +401,13 @@ public actor EchoCanceller {
             }
             return
         }
+        // Advance referenceStart by exactly what was removed — clamping the
+        // removal but not the index would desync referenceStart from
+        // reference[0] whenever the mic drains past the received reference.
         let needFrom = pendingMicStart + offset - referenceSlackSamples
-        let drop = needFrom - referenceStart
+        let drop = min(needFrom - referenceStart, Int64(reference.count))
         if drop > 0 {
-            reference.removeFirst(Int(min(drop, Int64(reference.count))))
+            reference.removeFirst(Int(drop))
             referenceStart += drop
         }
     }
