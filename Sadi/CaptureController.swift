@@ -120,17 +120,36 @@ final class CaptureController {
         // through the normal path.
         do {
             let micURL = paths.micURL(segment: 1)
+            let aecLocations = modelHost.aecLocations
             // The anchor is the stream's sample-0 wall clock; stamping it
             // right after the unit starts (rather than at session start) keeps
             // utterance timestamps honest even when bring-up blocked for a
             // second on a balky device.
-            let (mic, micWriter, anchor) = try await Task.detached(priority: .userInitiated) {
+            let (mic, micWriter, anchor, aecEngine) = try await Task.detached(priority: .userInitiated) {
                 let m = try MicCapture()
                 let w = try SegmentArchiveWriter(url: micURL, sampleRate: m.sampleRate)
                 try m.start()
-                return (m, w, Date())
+                // Anchor at the stream's true sample 0 — the first delivered
+                // frame — rather than at start()'s return. The mic delivers
+                // within tens of ms; the bounded poll covers a slow device.
+                var anchor = Date()
+                for _ in 0..<40 {
+                    if let fht = m.firstHostTime {
+                        anchor = HostClock.date(atHostTime: fht)
+                        break
+                    }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                // Fresh AEC engine per session (a LocalVQE context carries
+                // streaming state that must not be shared with a concurrent
+                // offline pass); built here to keep dlopen/GGUF work off main.
+                let engine = ModelHost.makeAEC(locations: aecLocations)
+                return (m, w, anchor, engine)
             }.value
             do {
+                // One canceller per session; nil when the engine didn't load
+                // (mic then runs raw and the text-level echo filter carries).
+                session.echoCanceller = aecEngine.map { EchoCanceller(engine: $0) }
                 let processor = try StreamProcessor(
                     source: .mic,
                     sourceRate: mic.sampleRate,
@@ -139,7 +158,8 @@ final class CaptureController {
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
-                    startWallClock: anchor
+                    startWallClock: anchor,
+                    echoCanceller: session.echoCanceller
                 )
                 session.add(StreamPipeline(
                     source: .mic,
@@ -179,16 +199,11 @@ final class CaptureController {
         // producing audio. Opening the mic input can kick off a Bluetooth
         // A2DP→HFP profile switch that churns CoreAudio for ~1 s; creating the
         // system process tap during that window corrupts it (-10877 storms, a
-        // collapsed effective rate). The mic's first delivered frame signals
-        // the input device (and any profile switch) has settled.
+        // collapsed effective rate). The mic-anchor wait during bring-up
+        // already blocked on the mic's first delivered frame (same ~2 s
+        // bound), so by the time this task runs the input path has settled.
         session.systemStartTask = Task { [weak self] in
             guard let self else { return }
-            let mic = session.pipeline(for: .mic)?.capture
-            for _ in 0..<40 {  // up to ~2 s
-                if Task.isCancelled { return }
-                if mic?.firstHostTime != nil { break }
-                try? await Task.sleep(for: .milliseconds(50))
-            }
             guard !Task.isCancelled, self.phase == .recording else { return }
             await self.startSystemPipeline(in: session)
         }
@@ -214,12 +229,46 @@ final class CaptureController {
         // tens of ms of the tap's first frame, well below noticeable.
         do {
             let systemURL = session.paths.systemURL(segment: 1)
-            let (system, systemWriter, anchor) = try await Task.detached(priority: .userInitiated) {
+            let system = try await Task.detached(priority: .userInitiated) {
                 let s = try SystemAudioCapture()
-                let w = try SegmentArchiveWriter(url: systemURL, sampleRate: s.sampleRate)
                 try s.start()
-                return (s, w, Date())
+                return s
             }.value
+
+            // Process taps deliver NOTHING until some process actually plays
+            // audio — start a recording before the meeting and the first
+            // frame may be minutes away. That first frame IS the stream's
+            // sample 0, so wait for it (cancellably, unbounded) and anchor
+            // there. Stamping Date() at start() shifted the whole system
+            // timeline by the leading silence (observed: a 17.5 s anchor
+            // error that broke echo-canceller alignment outright).
+            systemStatus = "waiting for audio"
+            var firstHost: UInt64?
+            while !Task.isCancelled, phase == .recording {
+                if let fht = system.firstHostTime {
+                    firstHost = fht
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard let firstHost, !Task.isCancelled, phase == .recording else {
+                // Recording stopped before any system audio played. No
+                // system pipeline, no system file: it's a mic-only session.
+                await Task.detached(priority: .userInitiated) { system.stop() }.value
+                systemStatus = "no system audio"
+                return
+            }
+            let anchor = HostClock.date(atHostTime: firstHost)
+            let systemWriter: SegmentArchiveWriter
+            do {
+                systemWriter = try await Task.detached(priority: .userInitiated) {
+                    try SegmentArchiveWriter(url: systemURL, sampleRate: system.sampleRate)
+                }.value
+            } catch {
+                // Don't leak a running, unregistered tap.
+                await Task.detached(priority: .userInitiated) { system.stop() }.value
+                throw error
+            }
             do {
                 let processor = try StreamProcessor(
                     source: .system,
@@ -229,7 +278,8 @@ final class CaptureController {
                     diarizerModel: diarizerModel,
                     embeddingDiarizer: embeddingDiarizer,
                     store: transcript,
-                    startWallClock: anchor
+                    startWallClock: anchor,
+                    echoCanceller: session.echoCanceller
                 )
                 session.add(StreamPipeline(
                     source: .system,

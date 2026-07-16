@@ -28,7 +28,7 @@ This problem has been solved many times. Real-time VoIP comms use sophisticated 
 - **Robust to the common failure modes we know about** (multi-channel mics, sandbox quirks, sample-rate drift, bleed during far-end speech, similar-sounding local and far-end voices).
 
 ### Non-Goals
-- No *custom* real-time acoustic echo cancellation (FDAF / NLMS / WebRTC AEC). The OS echo canceller (VoiceProcessingIO) runs in-line on the mic (§5.1); the text-level echo filter (§7) remains as backstop.
+- No *hand-rolled* acoustic echo cancellation (FDAF / NLMS / WebRTC AEC). Echo is cancelled in-process by a small neural AEC model (LocalVQE v1.4-AEC, §6.2a) with the system-audio stream as the reference; the text-level echo filter (§7) remains as backstop. The OS canceller (VoiceProcessingIO) is deliberately NOT used — see Appendix A.
 - No recovery of *quiet local speech that overlaps loud far-end speech* ("yeah/right" backchannels mid-far-end-turn). Explicitly acceptable to lose, per the primary use case.
 - No cloud ASR backends. Local-only.
 - No meeting platform integrations (Zoom SDK, Meet bot, Teams bot). Local capture only.
@@ -126,15 +126,17 @@ Capacity per ring: sized for the maximum tolerated end-to-end consumer latency. 
 
 ### 5.1 Microphone Capture (`MicCapture`)
 
-- **Framework:** a raw **VoiceProcessingIO** audio unit (`kAudioUnitSubType_VoiceProcessingIO`), input on element 1, output on element 0. Not `AVAudioEngine` (hidden aggregate devices, graph-rebuild storms on device changes — see Appendix A).
-- **OS echo cancellation in-line.** VPIO's AEC uses everything played to the bound output device — including other apps (Zoom/Meet) — as the echo reference, so far-end bleed is removed at capture. The whole pipeline (archive, ASR, voiceprints) sees echo-suppressed audio; §7's text-level filter is the backstop. The output element renders silence (it exists only as the reference tap). AGC is disabled; other-audio ducking is pinned to minimum (`kAUVoiceIOOtherAudioDuckingLevelMin`, advanced ducking off) so the user's call volume is not ducked. **Known cosmetic quirk:** at minimum ducking the steady-state attenuation of other audio measures 0 dB, but macOS still applies a *transient* duck (~-34 dB) when the voice session starts and when new audio streams begin, releasing over several seconds — an audible volume dip at recording start. This is coreaudiod's session ducking, not configurable below `.min` (the duck-off property is iOS-only and deprecated); its hysteresis is sloppy and the armed state can briefly outlive a session before clearing on its own or on the next session cycle. Measured via 440 Hz tone + raw AUHAL reference recorder (scratch/speech-compare/raw_rec.swift). Verified: `Sadi cli mic` with reference audio playing — the played speech transcribes to nothing while room audio survives (recipe probe: `scratch/speech-compare/vpio_probe.swift`).
-- **Multi-channel handling:** none needed — VPIO consumes the device's mic array itself and emits one processed voice channel (client format Float32 mono).
-- **Sample rate:** Query the **hardware** nominal rate of the resolved input device (`kAudioDevicePropertyNominalSampleRate`) once at init; VPIO's converters bridge device-rate changes across device switches to the fixed client rate.
-- **Device follow:** the unit follows the system default input (refusing Bluetooth mics — HFP conflicts with the system tap) *and* the system default output (the AEC reference must track wherever call audio plays; Bluetooth outputs are skipped in favor of a non-BT device since headphones have no speaker→mic bleed to cancel).
-- **Input callback work:** render processed mono → host-time gap fill → `ring.push(data:)`. Nothing else. The first-buffer host time is recorded once via a separate atomic so the consumer can convert sample offsets to wall-clock dates.
+- **Framework:** a raw **AUHAL input unit** (`kAudioUnitSubType_HALOutput`, input enabled, output disabled). Not `AVAudioEngine` (hidden aggregate devices, graph-rebuild storms on device changes) and not VoiceProcessingIO (see Appendix A — its session ducking and by-design device gain changes degrade live meetings).
+- **No voice processing on the unit.** The mic stream leaves capture raw; echo cancellation happens in-process at the 16 kHz pipeline stage (§6.2a), which has zero footprint on other apps' audio.
+- **Multi-channel handling:** take **channel 0 only** (deinterleaved render into a pre-allocated buffer list). MacBook built-in mics expose multi-channel arrays where channels 1+ are directional/cancellation beams; averaging them destroys the voice signal.
+- **Sample rate:** the client format is fixed at the device's nominal hardware rate read at init (`kAudioDevicePropertyNominalSampleRate`); the AUHAL's converter bridges device-rate changes across device switches.
+- **Device follow:** a default-input listener retargets the live unit via `kAudioOutputUnitProperty_CurrentDevice` (debounced ~1 s), refusing Bluetooth inputs (HFP would conflict with the system tap).
+- **Input callback work:** render channel 0 → host-time gap fill (silence) → `ring.push(data:)`. Nothing else. The first-buffer host time is recorded once via a separate atomic so the consumer can convert sample offsets to wall-clock dates.
 - **No file write here.** The consumer thread pulls samples and writes the archive file (§6.1).
 
 ### 5.2 System Audio Capture (`SystemAudioCapture`)
+
+> **Wall-clock lock:** process taps deliver NOTHING until some process first plays audio (start a recording pre-meeting and the first frame is minutes away), stall when playback stops, and deliver stale catch-up bursts after route churn. The stream is therefore anchored at its **first delivered frame** (`HostClock.date(atHostTime: firstHostTime)`, awaited cancellably in the bring-up task — a recording stopped before any system audio simply has no system track); after that, The IOProc back-fills host-time gaps with silence and drops stale bursts (same scheme as §5.1's mic path), keeping the ring's sample count locked to wall-clock — without this the stream timeline warps by seconds, breaking AEC alignment and utterance timestamps. The effective-rate retune (§ Phase 9) additionally rejects readings >2% off nominal: it exists for sub-percent clock drift, and burst-polluted measurements (a transient 72 kHz reading on a 48 kHz tap was observed) must never rebuild the resampler.
 
 - **Framework:** **CoreAudio process tap**, not ScreenCaptureKit. Specifically:
   - `AudioHardwareCreateProcessTap` with `kAudioSubTapMixdown` (or its mono variant) to get a single-channel mix of system output.
@@ -178,6 +180,14 @@ Backpressure: the ring is bounded. If `ring.push(...)` returns `false` (full) �
 - **Operation:** the VAD consumer pulls 16 kHz samples from the ring buffer in fixed-size frames (e.g., 30 ms), runs Silero, and applies a state machine: `idle → speaking (on threshold crossing + min-speech-ms) → idle (on threshold-drop + min-silence-ms)`. On each `speaking → idle` transition, emit a `SpeechSegment { samples, startHostTime, endHostTime }`.
 - **Buffering:** keep a small lookahead (~200 ms) so the segment boundary doesn't clip the first phoneme.
 - **Output:** an `AsyncStream<SpeechSegment>`.
+
+### 6.2a Acoustic Echo Cancellation (`EchoCanceller`, call mode)
+
+- **Model:** LocalVQE **v1.4-AEC** (203 K params, echo-only: passes near-end voice, noise, and room through — keeps WeSpeaker embeddings trustworthy), GGUF via `liblocalvqe.dylib` (GGML, CPU, ~22x realtime). Vendored in `Vendor/localvqe/`; rebuild with `scripts/build-localvqe.sh`.
+- **Reference:** the system-audio stream — the same 16 kHz samples the system `StreamProcessor` consumes. Alignment is wall-clock (each stream declares its sample-0 anchor) **plus a measured refinement**: anchors get into the right second, but the AEC needs tens of milliseconds, so the canceller cross-correlates 20 ms RMS envelopes of both streams every ~4 s (±2 s search, confidence- and consistency-gated) and applies the residual offset to future hops. The remaining acoustic delay is absorbed by the model's adaptive-filter front-end. Never trust anchors alone — a 1.6 s real-world anchor error broke AEC entirely before the refiner existed.
+- **Placement:** mic path only, post-resample, pre-VAD — VAD, diarizer, ASR, and embeddings all consume *cleaned* audio. The canceller preserves sample count/order, so cleaned-stream indices equal raw-stream indices and all wall-clock math is unchanged. **Archives stay raw** — a rerun re-derives the cleaned mic from the pristine recording (and benefits from future model upgrades).
+- **Degradation:** missing model/dylib, mic-only mode, or a stalled reference stream → bounded buffering then raw passthrough. AEC is an enhancement, never a gate; §7's text filter remains the backstop (it eats ASR output from the model's quiet residual, deliberately un-gated because a hard noise gate would eat quiet real speech).
+- The offline pipeline (§ finalize/rerun) runs the same stage batch, before diarization, so echo cannot seed phantom mic clusters.
 
 ### 6.3 Per-Track ASR
 
@@ -453,6 +463,7 @@ The UI subscribes to `TranscriptStore`'s `AsyncStream<TranscriptEvent>`; `Transc
 
 ### Swift packages
 - **FluidAudio** (pinned to a known-good version; bump deliberately): provides LS-EEND (streaming diarizer), Silero VAD, the offline diarizer, and the embedding model used for voiceprints. (ASR moved to Apple SpeechTranscriber; Parakeet is no longer downloaded.)
+- **LocalVQE** (vendored binary + model in `Vendor/localvqe/`, Apache-2.0/MIT): `liblocalvqe.dylib` (dlopen'd, embedded in the app bundle, code-signed on copy) + the v1.4-AEC GGUF (bundled resource). No SwiftPM dependency; the Swift side is a ~100-line dlsym wrapper in SadiKit.
 - (Stretch) **Sparkle** for auto-update if/when shipped.
 
 No DSP libraries. No WebRTC. No custom CoreML model bundling beyond what FluidAudio handles.
@@ -607,7 +618,7 @@ Scoped to backend/pipeline correctness and crash safety. New data is surfaced **
 
 This spec encodes specific failures from the previous iteration:
 
-- **VPIO is not used at all.** *(Revisited and reversed on macOS 26 — see §5.1.)* The v0 failures no longer reproduce: a sandboxed VPIO unit starts cleanly with no mach-lookup exception entitlement, no downlink-DSP faults, and no I/O overload (silence render callback on the output element, `kAudioUnitProperty_SetRenderCallback`). The claim that VPIO only cancels our own engine's playback was empirically wrong on macOS 26: a separate process's speaker playback is fully cancelled (`Sadi cli mic` while a second process plays reference audio → empty transcript). Historical v0 record kept for context: sandbox required `com.apple.security.temporary-exception.mach-lookup.global-name` for `com.apple.audioanalyticsd`; undriven render side produced continuous downlink-DSP faults; driving it created I/O overload; some hardware exposed a multi-channel "discrete" format that silently downmixed to zero.
+- **VPIO is not used.** *(Re-tested on macOS 26, shipped briefly, then reverted — the v0 technical failures no longer reproduce, but the approach is wrong for this app.)* On macOS 26 a sandboxed VPIO unit starts cleanly (no mach-lookup entitlement, no DSP faults) and does cancel other processes' playback. But any active voice-processing session (a) ducks all other audio ~5.5 dB steady-state even at `kAUVoiceIOOtherAudioDuckingLevelMin`, with -34 dB transients and sloppy multi-second releases, and (b) applies a by-design gain change to the shared mic and output devices (Apple-confirmed, not disableable) that meeting apps' AGC then fights — a Meet participant heard the local user muddled during recording and blasting after stop. OpenOats independently ships Apple AEC hard-disabled for adjacent reasons (aggregate reconfiguration stalls vs their system tap). Echo cancellation therefore runs *in-process* (LocalVQE, §6.2a) where it cannot touch other apps' audio.
 - **Mono channel-0 capture, not averaging.** MacBook built-in mic arrays expose multi-channel formats (front beam + directional / cancellation beams); averaging across channels causes destructive interference and effectively silences the voice. Always take channel 0.
 - **Diarizing a *mix* of mic + system collapses both speakers into one cluster** when one is much louder. Per-track ASR is not negotiable.
 - **Per-track normalization + raw energy comparison for bleed gating** is necessary (normalization is needed so ASR sees the quiet mic; raw comparison is needed so the energy gate isn't fooled by the boost).

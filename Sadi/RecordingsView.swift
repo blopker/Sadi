@@ -28,7 +28,7 @@ final class RecordingsStore {
             return []
         }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
         var loaded: [RecordingItem] = []
         for dir in dirs where (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
             let sessionURL = dir.appending(path: "session.json", directoryHint: .notDirectory)
@@ -54,7 +54,7 @@ final class RecordingsStore {
     nonisolated static func loadItem(from directory: URL) -> RecordingItem? {
         let url = directory.appending(path: "session.json", directoryHint: .notDirectory)
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
         guard let data = try? Data(contentsOf: url),
               let session = try? decoder.decode(Session.self, from: data)
         else { return nil }

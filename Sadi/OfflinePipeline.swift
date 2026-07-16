@@ -105,14 +105,74 @@ enum OfflinePipeline {
 
         progress("Decoding audio…")
         let sessionStart = session.startedAt
-        let tracks = try await hop {
+        var tracks = try await hop {
             try await decodeTracks(segment: segment, sessionStart: sessionStart, directory: sessionDirectory)
         }
         guard !tracks.isEmpty else { throw Failure.noAudio }
 
+        // Acoustic echo cancellation over the decoded mic track, system track
+        // as the far-end reference — the same LocalVQE stage the live pipeline
+        // runs, applied batch and BEFORE diarization so echo can't seed
+        // phantom mic clusters or pollute embeddings. Archives are raw, so
+        // every pass re-derives the cleaned mic from scratch (benefiting from
+        // whatever model ships at that time). Best-effort: without the engine
+        // the pass proceeds on raw mic + the text-level echo filter.
+        let aecLocations = modelHost.aecLocations
+        if aecLocations != nil,
+           let micIdx = tracks.firstIndex(where: { $0.source == .mic }),
+           let sys = tracks.first(where: { $0.source == .system }) {
+            progress("Cancelling echo…")
+            let micTrack = tracks[micIdx]
+            let cleaned = try await hop { () -> [Float]? in
+                // Own engine instance: a LocalVQE context carries streaming
+                // state and must not be shared with a concurrent live session.
+                guard let engine = ModelHost.makeAEC(locations: aecLocations) else { return nil }
+                let canceller = EchoCanceller(engine: engine)
+                let rate = Resampler.targetRate
+                // Interleave the feeds in wall-clock order, ~10 s at a time.
+                // Feeding the whole reference up front would trip the
+                // canceller's retention cap (it keeps only what queued mic
+                // can still need); interleaving keeps the reference window
+                // live, memory bounded, and gives the delay refiner its
+                // periodic re-estimates, exactly like the live pipeline.
+                let chunk = Int(rate) * 10
+                // Reference index that plays at the same instant as a given
+                // mic index, per the anchors (the canceller re-derives this
+                // internally; here it only sizes the feed-ahead).
+                let offset = Int((micTrack.anchor.timeIntervalSince(sys.anchor) * rate).rounded())
+                var out: [Float] = []
+                out.reserveCapacity(micTrack.samples.count)
+                var refFed = 0
+                var i = 0
+                while i < micTrack.samples.count {
+                    try Task.checkCancellation()
+                    let end = min(i + chunk, micTrack.samples.count)
+                    // Keep the reference fed ~1 s past this mic chunk's end.
+                    let refNeed = max(0, min(sys.samples.count, end + offset + Int(rate)))
+                    if refNeed > refFed {
+                        await canceller.feedReference(
+                            Array(sys.samples[refFed..<refNeed]), anchor: sys.anchor)
+                        refFed = refNeed
+                    }
+                    out += await canceller.processMic(
+                        Array(micTrack.samples[i..<end]), anchor: micTrack.anchor)
+                    i = end
+                }
+                out += await canceller.flushMic()
+                return out
+            }
+            if let cleaned {
+                tracks[micIdx] = Track(source: .mic, anchor: micTrack.anchor, samples: cleaned)
+            }
+        }
+
+        // Post-AEC track set is immutable from here; snapshot for the
+        // Sendable hop closures.
+        let finalTracks = tracks
+
         progress("Diarizing…")
         let diar = try await hop {
-            try await diarize(tracks: tracks, models: offlineModels)
+            try await diarize(tracks: finalTracks, models: offlineModels)
         }
 
         // The utterance set: draft from disk (finalize) or from audio (rerun).
@@ -130,11 +190,12 @@ enum OfflinePipeline {
                 RecordingsStore.loadTranscript(from: sessionDirectory)
                     .filter { $0.assignmentKind == .manual }
             }
+
             progress("Transcribing…")
             // Both tracks at once; each track internally fans its segments
             // out over an ASR worker pool (see `transcribe`).
             let diarSnapshot = diar
-            let trackSnapshot = tracks
+            let trackSnapshot = finalTracks
             let fresh = try await hop {
                 try await withThrowingTaskGroup(of: [Utterance].self) { group in
                     for track in trackSnapshot {
@@ -161,12 +222,12 @@ enum OfflinePipeline {
         try Task.checkCancellation()
 
         // Tail: clusters → labels → voiceprints → echo. Pure value passes.
-        utterances = reassignClusters(utterances, diar: diar, tracks: tracks)
+        utterances = reassignClusters(utterances, diar: diar, tracks: finalTracks)
         utterances = relabel(utterances)
 
         progress("Matching voiceprints…")
         let centroids = try await hop {
-            clusterCentroids(tracks: tracks, diar: diar, embedder: embedder)
+            clusterCentroids(tracks: finalTracks, diar: diar, embedder: embedder)
         }
         // Apply matches system-first so the mic pass can ask "is this
         // identity a far-end speaker?" against final system labels. A mic
@@ -268,7 +329,7 @@ enum OfflinePipeline {
         let url = directory.appending(path: "session.json", directoryHint: .notDirectory)
         guard let data = try? Data(contentsOf: url) else { throw Failure.noSessionMetadata }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
         return try decoder.decode(Session.self, from: data)
     }
 

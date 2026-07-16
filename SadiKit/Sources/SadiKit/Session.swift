@@ -51,11 +51,34 @@ public struct Session: Codable, Sendable {
     public func write(to directory: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = Session.dateEncodingStrategy
         let data = try encoder.encode(self)
         let url = directory.appending(path: "session.json", directoryHint: .notDirectory)
         try data.write(to: url, options: .atomic)
     }
+
+    /// Dates carry fractional seconds: the per-track anchors are sub-second
+    /// accurate by construction (host-clock derived) and the offline echo
+    /// canceller needs that precision — whole-second `.iso8601` would inject
+    /// up to ~1 s of relative error between the tracks.
+    public static let dateEncodingStrategy: JSONEncoder.DateEncodingStrategy = .custom { date, encoder in
+        var container = encoder.singleValueContainer()
+        try container.encode(date.formatted(fractionalStyle))
+    }
+
+    /// Tolerant decode: fractional first, plain ISO 8601 for older files.
+    public static let dateDecodingStrategy: JSONDecoder.DateDecodingStrategy = .custom { decoder in
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        if let date = (try? Date(raw, strategy: fractionalStyle))
+            ?? (try? Date(raw, strategy: .iso8601)) {
+            return date
+        }
+        throw DecodingError.dataCorrupted(.init(
+            codingPath: decoder.codingPath,
+            debugDescription: "Unparseable ISO 8601 date: \(raw)"))
+    }
+
+    private static let fractionalStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 }
 
 /// One uninterrupted recording period within a session. SPEC §9.

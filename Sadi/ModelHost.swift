@@ -2,6 +2,7 @@ import FluidAudio
 import Foundation
 import Observation
 import OSLog
+import SadiKit
 
 // FluidAudio's LSEENDModel uses an internal NSLock to serialize predict calls
 // (see Sources/FluidAudio/Diarizer/LS-EEND/LSEENDInference.swift). It does not
@@ -31,6 +32,14 @@ final class ModelHost {
     private(set) var state: LoadState = .idle
     private(set) var vad: VadManager?
     private(set) var asr: AppleAsr?
+    /// Validated LocalVQE dylib/model locations, set during `loadIfNeeded`.
+    /// `nil` when the engine can't be loaded — the pipeline then runs
+    /// without acoustic AEC (the text-level EchoFilter remains), so load
+    /// failure is non-fatal. Consumers construct their own engine instance
+    /// per use via `makeAEC()`: a LocalVQE context carries per-stream
+    /// adaptive-filter state, so a live session and a concurrent offline
+    /// pass must never share one.
+    private(set) var aecLocations: (library: URL, model: URL)?
     private(set) var diarizerModel: LSEENDModel?
     private(set) var embeddingDiarizer: DiarizerManager?
     /// Offline (batch) diarization model set — loaded lazily on the first
@@ -65,6 +74,46 @@ final class ModelHost {
         }
         guard fluidPresent else { return false }
         return await AppleAsr.assetsInstalled()
+    }
+
+    /// Locate the LocalVQE dylib + model. In the app bundle: dylib embedded
+    /// in Frameworks (code-signed on copy), model in Resources. The env var
+    /// override serves headless/dev runs outside a full bundle.
+    nonisolated static func localVQELocations() -> (library: URL, model: URL)? {
+        func locate(library: URL, model: URL) -> (URL, URL)? {
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: library.path(percentEncoded: false)),
+                  fm.fileExists(atPath: model.path(percentEncoded: false))
+            else { return nil }
+            return (library, model)
+        }
+        if let dir = ProcessInfo.processInfo.environment["SADI_LOCALVQE_DIR"] {
+            let d = URL(fileURLWithPath: dir, isDirectory: true)
+            if let found = locate(
+                library: d.appending(path: LocalVQE.libraryFilename),
+                model: d.appending(path: LocalVQE.modelFilename)) {
+                return found
+            }
+        }
+        guard let fw = Bundle.main.privateFrameworksURL, let res = Bundle.main.resourceURL else {
+            return nil
+        }
+        return locate(
+            library: fw.appending(path: LocalVQE.libraryFilename),
+            model: res.appending(path: LocalVQE.modelFilename))
+    }
+
+    /// Build a fresh LocalVQE engine (one per canceller/session). ~10 ms of
+    /// dlopen + GGUF parse — call off the main actor. Returns nil (logged)
+    /// when the engine is unavailable.
+    nonisolated static func makeAEC(locations: (library: URL, model: URL)?) -> LocalVQE? {
+        guard let locations else { return nil }
+        do {
+            return try LocalVQE(libraryURL: locations.library, modelURL: locations.model)
+        } catch {
+            Self.log.error("LocalVQE engine construction failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
     }
 
     /// Load (downloading on first use) the offline diarizer models. Memoized;
@@ -110,6 +159,20 @@ final class ModelHost {
                 }
             }
             self.asr = asr
+            state = .loading(fraction: 0.96, phase: "Loading echo canceller")
+
+            // LocalVQE AEC — bundled. Validate once (off-main: dlopen + GGUF
+            // parse) and remember the locations; consumers build their own
+            // engine per session via `makeAEC`. Non-fatal: without it the mic
+            // path runs raw and the text-level echo filter carries alone.
+            if let locations = Self.localVQELocations() {
+                let ok = await Task.detached(priority: .userInitiated) {
+                    Self.makeAEC(locations: locations) != nil
+                }.value
+                if ok { self.aecLocations = locations }
+            } else {
+                Self.log.error("LocalVQE dylib/model not found (continuing without AEC)")
+            }
             state = .loading(fraction: 0.97, phase: "Downloading LS-EEND")
 
             // LS-EEND streaming diarizer. dihard3 variant is the general-

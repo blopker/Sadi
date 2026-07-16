@@ -140,7 +140,11 @@ enum SadiCLI {
         stderr("Voiceprints loaded: \(book.prints.count)")
         let store = TranscriptStore(voiceprints: book)
 
-        // 3. Decode the requested tracks.
+        // 3. Decode the requested tracks. Per-track anchors come from
+        // session.json (the system track can start minutes after the mic —
+        // its capture anchors at the first delivered frame); older sessions
+        // without anchors fall back to the session start.
+        let segment = loadSegment(sessionDir: sessionDir)
         var tracks: [FileReplayDriver.Track] = []
         for (source, file) in selectedTracks(options.tracks, sessionDir: sessionDir) {
             guard FileManager.default.fileExists(atPath: file.path(percentEncoded: false)) else {
@@ -149,8 +153,9 @@ enum SadiCLI {
             }
             let (samples, rate) = try FileReplayDriver.decodeMono(file)
             let seconds = rate > 0 ? Double(samples.count) / rate : 0
-            stderr("  \(source == .mic ? "mic" : "system"): \(samples.count) samples @ \(Int(rate)) Hz (\(String(format: "%.1f", seconds)) s)")
-            tracks.append(.init(source: source, samples: samples, sampleRate: rate))
+            let anchor = (source == .mic ? segment?.micAnchor : segment?.systemAnchor) ?? sessionStart
+            stderr("  \(source == .mic ? "mic" : "system"): \(samples.count) samples @ \(Int(rate)) Hz (\(String(format: "%.1f", seconds)) s), anchor +\(String(format: "%.2f", anchor.timeIntervalSince(sessionStart))) s")
+            tracks.append(.init(source: source, samples: samples, sampleRate: rate, anchor: anchor))
         }
         guard !tracks.isEmpty else {
             throw CLIError("no audio tracks to replay in \(sessionID).")
@@ -165,7 +170,7 @@ enum SadiCLI {
             diarizerModel: diarizerModel,
             embeddingDiarizer: embeddingDiarizer,
             store: store,
-            startWallClock: sessionStart
+            aec: ModelHost.makeAEC(locations: host.aecLocations)
         )
 
         // 5. Print results (stdout) + summary; dropped detail to stderr.
@@ -228,12 +233,10 @@ enum SadiCLI {
 
     // MARK: - Mic test
 
-    /// Sandboxed end-to-end check of the live mic path: MicCapture (VPIO +
-    /// AEC) → resample → Apple ASR. Prints level stats and the transcript.
-    /// Diagnostic for exactly the failure modes App Sandbox can introduce
-    /// around VoiceProcessingIO (mach-lookup denials, silent capture).
+    /// Sandboxed end-to-end check of the live mic path: MicCapture (raw
+    /// AUHAL) → resample → Apple ASR. Prints level stats and the transcript.
     static func micTest(seconds: Double) async throws {
-        stderr("Recording \(seconds)s from the mic (VPIO voice processing on)…")
+        stderr("Recording \(seconds)s from the mic…")
         let mic = try MicCapture()
         stderr("  client rate: \(Int(mic.sampleRate)) Hz")
         try mic.start()
@@ -278,6 +281,16 @@ enum SadiCLI {
         }
         let result = try await asr.transcribe(samples16k)
         print("transcript: \(result.text.isEmpty ? "(empty)" : result.text)")
+    }
+
+    /// First segment of session.json, or nil (missing/corrupt — replay then
+    /// falls back to session-start anchors, matching pre-anchor sessions).
+    static func loadSegment(sessionDir: URL) -> Segment? {
+        let url = sessionDir.appending(path: "session.json", directoryHint: .notDirectory)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = Session.dateDecodingStrategy
+        return (try? decoder.decode(Session.self, from: data))?.segments.first
     }
 
     // MARK: - Session resolution
@@ -392,8 +405,8 @@ enum SadiCLI {
       rerun          Full regeneration from audio: offline VAD + batch ASR +
                      the finalize tail. WRITES transcript.json/session.json.
       mic            Diagnostic: record SECONDS (default 10) from the live
-                     MicCapture (VPIO echo cancellation on), print level
-                     stats and the ASR transcript. Nothing written to disk.
+                     MicCapture, print level stats and the ASR transcript.
+                     Nothing written to disk.
 
     ARGS:
       SESSION        Session id (e.g. 2026-05-28-14-03-09) or a path to a
